@@ -80,7 +80,7 @@ def resolve_model_path(path: str) -> str:
     return path
 
 
-@hydra.main(config_path="config", config_name="split_demo", version_base=None)
+@hydra.main(config_path="config", config_name="split_demo_v1", version_base=None)
 def main(config: DictConfig) -> None:
     """入口函数。"""
 

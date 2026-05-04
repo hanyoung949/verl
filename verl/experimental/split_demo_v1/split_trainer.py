@@ -55,7 +55,7 @@ class SplitGRPOTrainer:
         self.loss_scale_factor = int(config.algorithm.loss_scale_factor)
         self.log_gpu_memory = bool(getattr(config.trainer, "log_gpu_memory", False))
         self.log_transport = bool(getattr(config.trainer, "log_transport", False))
-        self.save_dir = Path(str(getattr(config.trainer, "save_dir", "verl/experimental/split_demo/checkpoints")))
+        self.save_dir = Path(str(getattr(config.trainer, "save_dir", "verl/experimental/split_demo_v1/checkpoints")))
         self.save_latest = bool(getattr(config.trainer, "save_latest", True))
 
         self.optimizer = torch.optim.AdamW(

@@ -6,7 +6,7 @@ model:
 data:
   # 期望是 jsonl，每行至少包含 {"prompt": "...", "answer": "..."}
   # 默认使用仓库内的最小样本，便于直接做 smoke test。
-  train_file: "verl/experimental/split_demo/sample_data/train.jsonl"
+  train_file: "verl/experimental/split_demo_v1/sample_data/train.jsonl"
   max_prompt_length: 256
 
 split:
@@ -47,6 +47,6 @@ trainer:
   log_freq: 10
   log_gpu_memory: true
   log_transport: true
-  save_dir: "verl/experimental/split_demo/checkpoints"
+  save_dir: "verl/experimental/split_demo_v1/checkpoints"
   save_latest: true
   seed: 42
