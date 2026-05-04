@@ -129,4 +129,4 @@ ENV/
 logs
 log
 outputs
-.history.kilo/plans/
+.kilo/plans/
