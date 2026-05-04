@@ -35,6 +35,19 @@ Do not open one-off PRs for tiny edits (single typo, isolated style change, one 
 
 If work is duplicate/trivial busywork, **do not proceed**. Return a short explanation of what is missing.
 
+### Fail-fast on repeated tool errors
+
+If a tool call (write, bash, edit, etc.) fails with the **same error 3 times consecutively**, **stop retrying immediately**. Instead:
+
+1. Report the error to the user with the exact error message.
+2. Ask the user for help or an alternative approach.
+3. Never enter an infinite retry loop — each failed retry wastes tokens and provides no value.
+
+Common cases:
+- **Plan mode blocking writes**: If `write`/`bash` tools keep returning schema errors, the session may be in read-only plan mode. Stop and ask the user to switch to code mode.
+- **Missing permissions**: If a command keeps getting permission errors, report it rather than retrying.
+- **Tool parameter issues**: If a tool call keeps failing due to parameter format, try one alternative approach, then stop and report.
+
 ---
 
 ## 2. Development Workflow
