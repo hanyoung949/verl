@@ -48,6 +48,16 @@ Common cases:
 - **Missing permissions**: If a command keeps getting permission errors, report it rather than retrying.
 - **Tool parameter issues**: If a tool call keeps failing due to parameter format, try one alternative approach, then stop and report.
 
+### Memory control
+
+When running GPU-intensive tasks (model loading, training, inference), monitor and control memory usage:
+
+- Use `trainer.total_steps` / `trainer.log_freq` / `rollout.max_new_tokens` to limit computation per run
+- Prefer smaller test configs (e.g., `max_new_tokens=24`, `group_size=4`, `mini_batch_size=8`) for smoke tests
+- Check `torch.cuda.memory_allocated()` / `max_memory_allocated()` in logs
+- If a test hangs or OOMs, reduce batch size or sequence length rather than retrying with the same config
+- Always run smoke tests with minimal settings first (`total_steps=1`), then scale up
+
 ---
 
 ## 2. Development Workflow

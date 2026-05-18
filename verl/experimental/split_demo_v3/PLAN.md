@@ -1,579 +1,813 @@
-# Split Actor GRPO Demo v3 — verl 集成技术方案
+# Split Demo v3 — veRL 兼容的 Split Actor 基线
 
-> **目标**：把 split transport 做成 verl Worker 的可插拔组件，复用 Ray/vLLM/FSDP/Checkpoint 等已有基础设施。
-> **范围**：`verl/experimental/split_demo_v3/`
-> **前置**：v2 NCCL 双进程版已验证通过（Phase 1-3）
-
----
-
-## 目录
-
-1. [背景与动机](#1-背景与动机)
-2. [verl 主线架构分析](#2-verl-主线架构分析)
-3. [核心挑战](#3-核心挑战)
-4. [整体架构设计](#4-整体架构设计)
-5. [阶段 1：Ray 集成](#5-阶段-1ray-集成)
-6. [阶段 2：SplitEngine](#6-阶段-2splitengine)
-7. [阶段 3：vLLM 集成](#7-阶段-3vllm-集成)
-8. [阶段 4：生产化](#8-阶段-4生产化)
-9. [关键设计决策](#9-关键设计决策)
-10. [风险与缓解](#10-风险与缓解)
-11. [附录：verl 接口参考](#11-附录verl-接口参考)
+> 最后更新：2026-05-18
+> 范围：`verl/experimental/split_demo_v3/`
+> 目标：构建一个干净的 2-rank split actor 基线，使其符合 veRL 的数据流和 Engine 抽象，同时保留未来 v4 多 stage pipeline 所需的核心逻辑。
 
 ---
 
-## 1. 背景与动机
+## 0. 摘要
 
-v2 (`split_demo_v2`) 用 `torchrun` 启动双进程，通过 NCCL P2P 实现跨进程前向和梯度传递，验证了"层间拆分 + 跨进程可微"的核心思路可行。
+v3 不是最终的多机 A800 架构。v3 是一个最小但有价值的系统：它应该先“说 veRL 的语言”。
 
-但 v2 有以下局限性：
+v3 的目标是：
 
-- **进程管理**：`torchrun` 固定 2 进程，无容错、无弹性
-- **训练引擎**：手写训练循环，没有复用 verl 的 Engine 抽象
-- **推理引擎**：手写 NaiveSplitRollout，无 KV cache、无 vLLM
-- **Checkpoint**：手写 adapter_state.pt，不兼容 verl 的 CheckpointEngine
-- **数据协议**：原始 tensor + dict，不兼容 verl 的 DataProto
+```text
+v3 = 2-rank torchrun split actor
+   + BaseEngine-compatible SplitEngine
+   + DataProto-compatible train/infer inputs
+   + veRL-style old_log_prob/update_actor/checkpoint semantics
+   + reusable front/middle/tail boundaries for v4
+```
 
-v3 的目标是把 split transport 集成进 verl 的框架中，复用其所有基础设施。
+v3 的目标不是：
+
+```text
+v3 != Ray 双 Actor 生产运行时
+v3 != 多 stage pipeline
+v3 != stage 内 tensor parallel runtime
+v3 != 不惜代价完整接入 RayPPOTrainer
+```
+
+长期设计仍然是：
+
+```text
+veRL control flow
+  rollout -> reward -> old_log_prob -> advantage -> actor update -> weight sync
+
+custom split computation flow
+  Head stage -> Middle stage(s) -> Tail stage
+  activation/grad 通过 NCCL/RDMA 传输，不走 Ray object store
+```
+
+v3 应该先把上层 veRL 接口做正确，再由 v4 扩展下层 computation flow。
 
 ---
 
-## 2. verl 主线架构分析
+## 1. 设计定位
 
-### 2.1 核心组件
+### 1.1 为什么需要 v3
 
+v1 和 v2 已经证明了 split learning 的核心可行性：
+
+- v1 证明了同进程 split training 可以通过可微 device transfer 跑通。
+- v2 证明了跨进程 NCCL send/recv 和 middle layer 本地 backward 是正确的。
+- v3 要证明：同一个 split actor 可以被整理成 veRL 风格的训练后端。
+
+v3 最重要的产物不是“能跑的 demo”，而是一个干净的 Engine 边界：
+
+```text
+外部视角：
+  一个 veRL-compatible actor engine
+
+内部视角：
+  rank0 edge process + rank1 frozen middle process
 ```
-main_ppo.py
-    │
-    └── RayPPOTrainer (Ray Actor, 单控制器)
-            │
-            ├── RayWorkerGroup
-            │       ├── TrainingWorker (FSDP/Megatron)    ← 训练引擎
-            │       │       └── BaseEngine (FSDPEngine/MegatronEngine)
-            │       ├── RolloutWorker (vLLM/SGLang)       ← 推理引擎
-            │       ├── RewardWorker                       ← reward model
-            │       └── RefPolicyWorker                    ← reference model
-            │
-            ├── ResourcePoolManager                        ← GPU 资源管理
-            └── DataProto                                  ← 统一数据协议
+
+### 1.2 v3 应该为 v4 保留什么
+
+| v3 组件 | v4 迁移目标 |
+|---|---|
+| `SplitEngine(BaseEngine)` | `SplitPipelineEngine(BaseEngine)` |
+| `SplitActorCore.forward_front()` | Head stage runner |
+| `SplitActorCore.forward_tail()` | Tail stage runner |
+| `MiddleWorker._run_layers()` | 通用 Middle stage runner |
+| `MiddleWorker.run()` | Stage service loop 和 local backward 协议 |
+| `NCCLMiddleExecutor` | 相邻 stage 的 transport/autograd bridge |
+| `main_split_v3.py` GRPO loop | Phase-0 数值基线 |
+| checkpoint save/load | per-stage checkpoint 设计 |
+| runtime stats | stage-level compute/communication metrics |
+
+### 1.3 v3 应该避免什么
+
+- 不以 Ray 双 Actor backward 为优化目标。
+- 不通过 Ray RPC 传 activation 或 gradient tensor。
+- 不在 v3 引入多 stage pipeline 代码。
+- 不在 v3 引入 stage 内 tensor parallel。
+- 不把 split 语义藏进无法映射到 veRL `TrainingWorker` 路径的临时训练循环里。
+
+---
+
+## 2. veRL 数据流与 v3 映射
+
+对当前工作最有用的 veRL 抽象是两级数据流：
+
+```text
+Control flow:
+  RLTrainer 调度 rollout、reward、logprob、advantage、update、checkpoint。
+
+Computation flow:
+  Model engine 执行 forward、backward、optimizer、inference、checkpoint。
 ```
 
-### 2.2 关键抽象
+即使 v3 仍然使用自定义入口，也应该让 control-flow 语义尽量贴近 veRL。
 
-| 抽象 | 位置 | 作用 |
-|---|---|---|
-| `Worker` | `single_controller/base/worker.py` | Worker 基类，管理 rank/world_size/device |
-| `TrainingWorker` | `workers/engine_workers.py` | 训练 Worker，持有 Engine |
-| `BaseEngine` | `workers/engine/base.py` | 训练引擎接口，有 FSDP/Megatron 等实现 |
-| `EngineRegistry` | `workers/engine/base.py` | 引擎注册表，按 (model_type, backend, device) 选择引擎 |
-| `RayWorkerGroup` | `single_controller/ray/base.py` | Ray Actor 组管理，dispatch/collect |
-| `ResourcePoolManager` | `single_controller/ray/base.py` | GPU 资源池管理 |
-| `DataProto` | `protocol.py` | 统一数据协议，TensorDict 封装 |
+### 2.1 Rollout 生成
 
-### 2.3 BaseEngine 接口
+veRL 形态：
+
+```text
+RLTrainer
+  -> ActorRolloutRefWorker.generate_sequences()
+  -> Rollout engine 生成 prompt + response
+  -> 返回 DataProto
+```
+
+v3 形态：
+
+```text
+main_split_v3.py
+  -> SimpleSplitRollout / NaiveSplitRollout
+  -> SplitActorCore.forward_full() under torch.no_grad()
+  -> 返回 sequences、attention_mask、response_ids、response_mask
+```
+
+v3 要求：
+
+- rollout 输出 key 要兼容 veRL 风格的 `DataProto`。
+- v3 可以继续使用 naive rollout。
+- vLLM 不是 v3 完成条件。
+
+### 2.2 Reward 计算
+
+veRL 形态：
+
+```text
+RLTrainer
+  -> RewardWorker 或 reward function
+  -> token_level_rewards / scores
+```
+
+v3 形态：
+
+```text
+FunctionReward
+  -> math_exact_match
+  -> token_level_scores
+```
+
+v3 要求：
+
+- reward 输出布局应能自然放入 `DataProto.batch["token_level_rewards"]`。
+- 保留 `uid` 或 group index，用于 GRPO 的 group-wise advantage 计算。
+
+### 2.3 Old Log Probability
+
+veRL 形态：
+
+```text
+Actor engine infer_batch()
+  -> old_log_probs
+```
+
+v3 形态：
+
+```text
+with torch.no_grad():
+  logits_old = split_core.forward_full(sequences, attention_mask)
+  old_log_prob = logprobs_from_logits(...)
+```
+
+v3 要求：
+
+- 将这类语义迁移到 `SplitEngine.infer_batch()` 或一个等价的轻量 wrapper 后面。
+- 输出 key 应使用 veRL 习惯命名：`old_log_probs`，或明确记录 v3 alias。
+
+### 2.4 Reference Log Probability
+
+v3 计划采用去 KL / 去 Reference Model 的算法路径。
+
+v3 要求：
+
+- baseline 不要求 ref model。
+- 除非未来实验需要，否则 `compute_ref_log_prob` 不在 v3 范围内。
+- config 中应明确这一点。
+
+### 2.5 Advantage 计算
+
+veRL 形态：
+
+```text
+RLTrainer 在本地根据 rewards/logprobs/group ids 计算 advantage。
+```
+
+v3 形态：
+
+```text
+compute_grpo_outcome_advantage(...)
+```
+
+v3 要求：
+
+- 继续复用 veRL 的 `compute_grpo_outcome_advantage`。
+- group id 放在 `non_tensor_batch`，或使用文档明确的 tensor-compatible 编码。
+
+### 2.6 Actor Update
+
+veRL 形态：
+
+```text
+ActorRolloutRefWorker.update_actor(mini_batch_data)
+  -> TrainingWorker.train_mini_batch()
+  -> engine.train_batch()
+```
+
+v3 形态：
+
+```text
+for minibatch:
+  logits_new = split_core.forward_full(...)
+  loss = GRPO/DAPO/Dr.GRPO loss
+  loss.backward()
+  optimizer.step()
+```
+
+v3 要求：
+
+- 训练路径必须能通过 `SplitEngine.train_batch(data, loss_fn)` 调用。
+- 自定义 loop 可以保留用于 debug，但 Engine 路径是规范接口。
+- rank0 返回 metrics；rank1 只负责 NCCL service。
+
+### 2.7 Weight Sync
+
+veRL 形态：
+
+```text
+actor weights -> rollout engine
+```
+
+v3 形态：
+
+```text
+naive rollout 和 training 使用同一个 SplitActorCore
+```
+
+v3 要求：
+
+- v3 完成不要求 vLLM 权重同步。
+- checkpoint 格式应为未来 adapter export to vLLM 做准备。
+
+---
+
+## 3. v3 运行时架构
+
+### 3.1 主线进程拓扑
+
+v3 主线使用 `torchrun` 启动两个稳定 OS 进程：
+
+```text
+torchrun --nproc_per_node=2 -m verl.experimental.split_demo_v3.main_split_v3
+
+rank0: edge / output rank
+  embed_tokens
+  front_layers + LoRA
+  tail_layers + LoRA
+  norm + lm_head
+  GRPO loss
+  optimizer
+  checkpoint
+
+rank1: middle service rank
+  frozen middle_layers
+  recv activation
+  local forward
+  recv grad_out
+  local backward
+  send grad_in
+```
+
+### 3.2 Forward 协议
+
+```text
+rank0:
+  h_front = embed + front(input_ids)
+  send h_front, position_ids, attention_mask
+
+rank1:
+  h_in = recv h_front
+  h_out = middle_layers(h_in)
+  send h_out
+
+rank0:
+  logits = tail + norm + lm_head(h_out)
+```
+
+### 3.3 Backward 协议
+
+```text
+rank0:
+  loss.backward()
+  _NCCLMiddleFunction.backward sends grad_h_middle
+
+rank1:
+  h_in = h_front.detach().requires_grad_(True)
+  h_out = middle_layers(h_in)
+  recv grad_h_middle
+  torch.autograd.backward(h_out, grad_h_middle)
+  send h_in.grad
+
+rank0:
+  receives grad_h_front
+  autograd continues through front layers
+```
+
+关键不变量：
 
 ```python
-class BaseEngine:
-    def initialize(self):                      # 加载模型/optimizer
-    def forward_backward_batch(self, data, loss_fn, forward_only=False):  # 前向+反向
-    def train_batch(self, data, loss_fn):      # 训练一步
-    def infer_batch(self, data, loss_fn=None): # 推理
-    def save_checkpoint(self, ...):            # 保存 checkpoint
-    def load_checkpoint(self, ...):            # 加载 checkpoint
-    def to(self, device, model=True, optimizer=True, grad=True):  # 设备管理
-    def get_data_parallel_size/rank/group(self):  # 数据并行信息
-    def is_mp_src_rank_with_outputs(self):     # 是否是模型并行输出 rank
+grad_h_front != grad_h_middle
+grad_h_front = grad_h_middle @ Jacobian(middle_layers)
 ```
 
-### 2.4 EngineRegistry 注册机制
+### 3.4 Rank 职责
+
+| Rank | Role | 返回 logits/loss | 更新参数 | 持有 optimizer |
+|---|---|---:|---:|---:|
+| rank0 | edge/output | yes | yes | yes |
+| rank1 | middle/service | no | no | no |
+
+`is_mp_src_rank_with_outputs()` 只应在 rank0 返回 true。
+
+---
+
+## 4. SplitEngine 设计
+
+`SplitEngine` 是 v3 接入 veRL Model Engine 抽象的桥。
+
+### 4.1 必须实现的接口
 
 ```python
-@EngineRegistry.register(model_type="llm", backend="fsdp", device="cuda")
-class FSDPEngine(BaseEngine):
-    ...
+initialize()
+forward_backward_batch(data, loss_function, forward_only=False)
+train_batch(data, loss_function)
+infer_batch(data, loss_function=None)
+optimizer_zero_grad()
+optimizer_step()
+lr_scheduler_step()
+save_checkpoint(...)
+load_checkpoint(...)
+train_mode()
+eval_mode()
+to(...)
+get_data_parallel_size()
+get_data_parallel_rank()
+get_data_parallel_group()
+is_mp_src_rank_with_outputs()
+```
 
-# 使用时：
-engine = EngineRegistry.new(model_type="llm", backend="fsdp", ...)
+### 4.2 数据归一化
+
+Engine 应同时接受内部 TensorDict 和 veRL DataProto：
+
+```python
+def normalize_batch(data):
+    if isinstance(data, DataProto):
+        return data.batch, data.non_tensor_batch, data.meta_info
+    if isinstance(data, TensorDict):
+        return data, {}, {}
+    raise TypeError(...)
+```
+
+v3 应保证模型计算路径与输入容器无关。训练数学不应依赖调用方使用 TensorDict 还是 DataProto。
+
+### 4.3 输入与输出 key
+
+最小输入 key：
+
+```text
+input_ids
+attention_mask
+responses
+response_mask
+old_log_probs
+advantages
+```
+
+可选 key：
+
+```text
+token_level_rewards
+uid / group_id
+position_ids
+loss_mask
+```
+
+最小输出 metrics：
+
+```text
+loss
+grad_norm
+clipfrac
+approx_kl
+entropy, if cheap
+```
+
+### 4.4 Train Batch 语义
+
+除非显式配置，否则 `train_batch` 应只执行一次 optimizer update：
+
+```text
+zero_grad
+forward_backward_batch(forward_only=False)
+clip_grad_norm
+optimizer.step
+return metrics
+```
+
+如果 PPO/GRPO 的多 epoch 训练仍在 Engine 外部执行，则调用方负责：
+
+- mini-batch slicing
+- epoch loop
+- dynamic sampling
+- advantage computation
+
+Engine 负责：
+
+- forward
+- backward
+- 与 middle rank 交换梯度
+- optimizer step
+- model state
+
+### 4.5 Infer Batch 语义
+
+`infer_batch` 应满足：
+
+- 在 `torch.no_grad()` 下执行。
+- 使用同一条 split forward 路径。
+- 根据调用方需要返回 logits 或 log probabilities。
+- 不修改 optimizer 或 gradients。
+
+DataProto key 稳定后，old-log-prob 计算应优先放在这里。
+
+---
+
+## 5. 算法基线
+
+v3 算法基线是 GRPO，并保留 DAPO / Dr.GRPO 风格配置。
+
+### 5.1 默认选择
+
+| Feature | v3 setting |
+|---|---|
+| Critic | disabled |
+| Reference model / KL | disabled by default |
+| Advantage | GRPO group-relative outcome advantage |
+| Std normalization | configurable, Dr.GRPO default is no std normalization |
+| Dynamic sampling | filter groups with zero reward variance |
+| Clip higher | asymmetric clip, e.g. low 0.2, high 0.28 |
+| Loss aggregation | sequence/token aggregation compatible with Dr.GRPO experiments |
+
+### 5.2 为什么 v3 默认不需要 Reference Model
+
+目标边云架构受益于移除 Reference Model：
+
+- 模型角色更少。
+- 边侧资源压力更低。
+- 不需要额外 ref-log-prob split forward。
+- veRL worker mapping 更简单。
+
+这是算法选择，应保留可配置性；但 v3 baseline 不应依赖 ref model。
+
+### 5.3 v3 暂不实现的算法优化
+
+- GTPO gradient correction
+- entropy-based filtering beyond simple metrics
+- MTP / draft model
+- overlong reward shaping beyond current reward hooks
+
+这些属于后续优化层。v3 首先要保证 split actor engine 正确。
+
+---
+
+## 6. Checkpoint 与状态
+
+### 6.1 v3 Checkpoint 格式
+
+当前目标：
+
+```text
+checkpoints/latest/
+  adapter_state.pt
+  optimizer.pt
+  adapter_meta.json
+```
+
+`adapter_meta.json` 应包含：
+
+```text
+model_path
+front_end
+middle_end
+global_step
+lora_r
+lora_alpha
+lora_target_modules
+trainable_param_names
+```
+
+### 6.2 Load 语义
+
+`load_checkpoint` 应恢复：
+
+- rank0 上的 trainable LoRA / front / tail state。
+- rank0 上的 optimizer state。
+- rank1 不恢复参数状态，因为 middle 冻结且从 base model 加载。
+
+### 6.3 v4 兼容性
+
+v4 需要 per-stage checkpoint：
+
+```text
+checkpoints/latest/
+  topology.json
+  stages/
+    stage_000_head/
+      adapter_state.pt
+      optimizer.pt
+    stage_005_tail/
+      adapter_state.pt
+      optimizer.pt
+```
+
+v3 不需要实现这个格式，但 v3 metadata 应包含足够信息，用于未来推导 head/tail split。
+
+---
+
+## 7. Metrics 与可观测性
+
+v3 应报告对 veRL 集成和 v4 性能对比都有价值的指标。
+
+### 7.1 训练指标
+
+```text
+reward_mean
+loss
+clipfrac
+approx_kl
+grad_norm
+valid_group_ratio
+```
+
+### 7.2 运行时指标
+
+```text
+rank0_peak_memory
+rank0_allocated_memory
+middle_executor_calls
+forward_to_middle_bytes
+attention_mask_bytes
+last_hidden_shape
+```
+
+### 7.3 面向 v4 的指标
+
+这些指标在 v3 中可以先由 rank0 估计：
+
+```text
+activation_bytes_per_forward
+gradient_bytes_per_backward
+num_split_round_trips
+```
+
+v4 会将它们扩展为 per-stage compute/communication timings。
+
+---
+
+## 8. Ray 与 vLLM 定位
+
+### 8.1 Ray 在 v3 中的定位
+
+Ray 双 Actor backward 不是 v3 完成条件。
+
+已知问题不应简单描述为“Ray actor 是线程”。Ray Actor 是进程，但当前实验混合了：
+
+- persistent NCCL rank semantics
+- Ray RPC method lifetime
+- CUDA tensor crossing driver/actor boundaries
+- PyTorch autograd C++ worker threads
+- NCCL/CUDA context initialization
+
+这使 center backward 很脆弱，并已经产生过 deadlock。
+
+v3 决策：
+
+```text
+main_split_v3.py = mainline
+main_ray_v3.py = experiment / issue reproduction
+edge_worker.py, center_worker.py = experiment
+center_process.py = possible future control-plane reference
+```
+
+未来 Ray 的角色：
+
+```text
+Ray = control plane
+  resource placement
+  process launch
+  health check
+  log collection
+  restart from checkpoint
+
+NCCL/RDMA = data plane
+  activation transfer
+  gradient transfer
+```
+
+### 8.2 vLLM 在 v3 中的定位
+
+vLLM 很有价值，但不是 v3 完成条件。
+
+v3 可以继续使用 naive rollout，直到 Engine / DataProto / checkpoint 接口稳定。未来 vLLM 集成应采用：
+
+```text
+training path: SplitEngine
+rollout path: vLLM full-model instance or future split-aware rollout
+weight sync: LoRA adapter export/import
 ```
 
 ---
 
-## 3. 核心挑战
+## 9. 分阶段工作计划
 
-### 3.1 范式冲突
+每个阶段都必须可以独立验证。
 
-| 维度 | verl 主线 | split 架构 | 冲突点 |
-|---|---|---|---|
-| 模型持有 | 每个 worker 完整模型 | 不同 worker 不同层 | FSDP 需要完整模型 wrap |
-| 并行策略 | FSDP (数据并行, ZeRO 分片) | 层间拆分 (pipeline 式) | 两种通信模式不同 |
-| 通信 | NCCL all-reduce (自动) | NCCL P2P send/recv (手动) | 不能混用 |
-| 推理 | vLLM (完整模型) | 无完整模型 | vLLM 需要完整实例 |
+### Phase 0：干净基线
 
-### 3.2 关键问题
+目标：当前 v3 torchrun 路径是数值基线。
 
-**Q1: FSDP 和层间拆分能共存吗？**
-
-不能直接共存。FSDP wrap 需要完整模型，split 没有完整模型。但可以：
-- 对 front/tail 的 LoRA 参数局部使用 FSDP（自定义 process_group）
-- 或者干脆不用 FSDP，只用 LoRA（当前 demo 的做法，适合 <7B）
-
-**Q2: verl 的 Worker 能持有"半个模型"吗？**
-
-可以。Worker 只是一个 Ray Actor，内部逻辑完全自定义。关键是要实现 BaseEngine 接口。
-
-**Q3: 梯度传递怎么接入 verl 的训练循环？**
-
-verl 的 `forward_backward_batch` 返回 loss，内部调用 `loss.backward()`。split 架构的 backward 需要通过 NCCL 交换梯度。这需要在 `forward_backward_batch` 中嵌入 NCCL 梯度传递逻辑。
-
----
-
-## 4. 整体架构设计
-
-### 4.1 v3 架构图
-
-```
-RayPPOTrainer (单控制器)
-    │
-    ├── RayWorkerGroup
-    │       │
-    │       ├── EdgeWorker (Ray Actor, GPU 0)
-    │       │       ├── SplitEngine
-    │       │       │       ├── embed_tokens
-    │       │       │       ├── front_layers + LoRA (训练)
-    │       │       │       ├── tail_layers + LoRA (训练)
-    │       │       │       ├── NCCLMiddleExecutor (P2P 通信)
-    │       │       │       └── optimizer
-    │       │       │
-    │       │       └── vLLMRollout (推理用, 完整模型)
-    │       │
-    │       ├── CenterWorker (Ray Actor, GPU 1)
-    │       │       └── MiddleExecutor (冻结 middle_layers)
-    │       │
-    │       └── (可选) RewardWorker
-    │
-    └── ResourcePoolManager
-            Pool 0: [GPU 0]  ← EdgeWorker
-            Pool 1: [GPU 1]  ← CenterWorker
-```
-
-### 4.2 与 v2 的关系
-
-| 组件 | v2 | v3 |
-|---|---|---|
-| 进程管理 | torchrun | Ray Actor + WorkerGroup |
-| rank0 逻辑 | SplitActorCore + Trainer | EdgeWorker + SplitEngine |
-| rank1 逻辑 | MiddleWorker.run() | CenterWorker + MiddleExecutor |
-| 通信 | 手写 NCCL P2P | 复用 verl 的 NCCL init |
-| 训练循环 | 手写 SplitGRPOTrainer | 复用 verl 的 RayPPOTrainer |
-| 数据 | 原始 dict | DataProto |
-| 推理 | NaiveSplitRollout | vLLMRollout (后期) |
-| Checkpoint | 手写 adapter_state.pt | CheckpointEngine (适配) |
-
----
-
-## 5. 阶段 1：Ray 集成
-
-**目标**：把 v2 的 torchrun 双进程改为 Ray 双 Actor，验证跨 Actor NCCL 通信。
-
-### 5.1 需要创建的文件
-
-```
-split_demo_v3/
-├── PLAN.md                          ← 本文档
-├── core/
-│   ├── __init__.py
-│   ├── edge_worker.py               ← EdgeWorker (Ray Actor, 前段+尾段)
-│   ├── center_worker.py             ← CenterWorker (Ray Actor, 中段)
-│   ├── middle_executor.py           ← NCCLMiddleExecutor (从 v2 复用/改写)
-│   └── split_engine.py              ← SplitEngine (BaseEngine 实现, 阶段 2)
-├── rollout/
-│   └── ...                          ← 从 v2 复用
-├── reward/
-│   └── ...                          ← 从 v2 复用
-├── config/
-│   └── split_demo_v3.yaml
-├── main_split_v3.py                 ← 入口 (Ray init + WorkerGroup 创建)
-└── split_trainer.py                 ← 适配 verl 接口的 trainer
-```
-
-### 5.2 EdgeWorker 设计
-
-```python
-from verl.single_controller.base.worker import Worker
-
-class EdgeWorker(Worker):
-    """rank0 Ray Actor: 持有 front + tail + LoRA, 通过 NCCL 与 CenterWorker 通信。"""
-
-    def __init__(self, config):
-        super().__init__()
-        # 加载模型, 拆分, 只保留 front/tail
-        # 创建 NCCLMiddleExecutor, 连接到 CenterWorker
-
-    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
-    def init_model(self, model_path, front_end, middle_end, lora_config):
-        """初始化模型和 NCCL 连接。"""
-
-    @register(dispatch_mode=...)
-    def forward_full(self, data: TensorDict) -> TensorDict:
-        """完整前向 (front → NCCL → tail)。"""
-
-    @register(dispatch_mode=...)
-    def train_step(self, data: TensorDict) -> TensorDict:
-        """训练一步: forward → loss → backward (含 NCCL 梯度传递) → optimizer.step()。"""
-```
-
-### 5.3 CenterWorker 设计
-
-```python
-class CenterWorker(Worker):
-    """rank1 Ray Actor: 持有冻结 middle_layers, 响应 NCCL 请求。"""
-
-    def __init__(self, config):
-        super().__init__()
-        # 加载模型, 拆分, 只保留 middle_layers + rotary_emb
-        # 冻结所有参数
-
-    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
-    def init_model(self, model_path, front_end, middle_end, lora_config):
-        """初始化 middle_layers。"""
-
-    def run_loop(self):
-        """请求响应循环 (从 v2 MiddleWorker.run() 复用)。"""
-```
-
-### 5.4 NCCL 连接建立
-
-verl 已经支持 Ray 环境下的 NCCL 初始化。两个 Ray Actor 启动后，需要：
-
-1. 获取对方的 MASTER_ADDR 和 MASTER_PORT
-2. 调用 `dist.init_process_group(backend="nccl")`
-3. 世界大小 = 2 (edge + center)
-
-```python
-# 在 main_split_v3.py 中
-edge_worker = EdgeWorker.options(
-    num_gpus=1,
-    resources={"GPU": 1}
-).remote(config)
-
-center_worker = CenterWorker.options(
-    num_gpus=1,
-    resources={"GPU": 1}
-).remote(config)
-
-# 获取地址, 初始化 NCCL
-ray.get([
-    edge_worker.init_nccl.remote(center_addr, center_port),
-    center_worker.init_nccl.remote(edge_addr, edge_port),
-])
-```
-
-### 5.5 验证
-
-```python
-# Phase 1: 验证 Ray Actor 启动 + NCCL 通信
-result = ray.get(edge_worker.forward_full.remote(test_data))
-assert result.shape == expected_shape
-
-# Phase 2: 验证梯度传递
-result = ray.get(edge_worker.train_step.remote(test_data))
-assert all params have .grad
-```
-
----
-
-## 6. 阶段 2：SplitEngine
-
-**目标**：实现 `SplitEngine(BaseEngine)`，适配 verl 的训练引擎接口。
-
-### 6.1 SplitEngine 接口
-
-```python
-@EngineRegistry.register(model_type="llm", backend="split", device="cuda")
-class SplitEngine(BaseEngine):
-    """层间拆分训练引擎。"""
-
-    def initialize(self):
-        # 加载模型 → 拆分 → 创建 optimizer (只包含 front/tail LoRA)
-        # 建立与 CenterWorker 的 NCCL 连接
-
-    def forward_backward_batch(self, data, loss_fn, forward_only=False):
-        # 前向: front → NCCL → tail → logits
-        # 如果 forward_only=False: loss.backward() (含 NCCL 梯度传递)
-        # 返回 logits + loss
-
-    def train_batch(self, data, loss_fn):
-        self.optimizer_zero_grad()
-        outputs = self.forward_backward_batch(data, loss_fn, forward_only=False)
-        grad_norm = self.optimizer_step()
-        return outputs
-
-    def save_checkpoint(self, local_path, ...):
-        # 保存 front/tail 的 LoRA 参数 + optimizer state
-
-    def load_checkpoint(self, local_path, ...):
-        # 加载 LoRA 参数 + optimizer state
-
-    def to(self, device, ...):
-        # 设备管理 (front/tail 移动)
-
-    def get_data_parallel_size/rank/group(self):
-        # split 架构下没有数据并行, 返回 1/0/None
-```
-
-### 6.2 关键实现细节
-
-**`forward_backward_batch` 的实现**:
-
-```python
-def forward_backward_batch(self, data, loss_fn, forward_only=False):
-    input_ids = data["input_ids"]
-    attention_mask = data["attention_mask"]
-
-    if forward_only:
-        with torch.no_grad():
-            logits = self.split_core.forward_full(input_ids, attention_mask)
-            loss = loss_fn(logits, data)
-        return {"loss": loss, "logits": logits}
-
-    # 有梯度的路径
-    logits = self.split_core.forward_full(input_ids, attention_mask)
-    loss = loss_fn(logits, data)
-    loss.backward()  # 梯度通过 NCCLMiddleExecutor 自动传递到 CenterWorker
-
-    return {"loss": loss, "logits": logits}
-```
-
-**`is_mp_src_rank_with_outputs`**:
-
-split 架构下, edge worker 是唯一的输出 rank (持有 lm_head), 返回 True。
-
-### 6.3 与 TrainingWorker 的集成
-
-verl 的 `TrainingWorker` 使用 `EngineRegistry.new()` 创建引擎。只需注册 SplitEngine：
-
-```python
-# split_demo_v3/core/split_engine.py
-@EngineRegistry.register(model_type="llm", backend="split", device="cuda")
-class SplitEngine(BaseEngine):
-    ...
-```
-
-然后在 config 中指定 `engine_config.strategy: "split"` 即可。
-
----
-
-## 7. 阶段 3：vLLM 集成
-
-**目标**：用 vLLM 替代 NaiveSplitRollout，获得高性能推理。
-
-### 7.1 核心问题
-
-vLLM 需要完整模型实例。split 架构中没有一个进程持有完整模型。
-
-### 7.2 解决方案
-
-```
-训练路径: SplitEngine (front+tail 在 edge, middle 在 center)
-推理路径: vLLM (完整模型, 独立实例, 放在 edge worker 的剩余显存中)
-权重同步: LoRA adapter → vLLM
-```
-
-### 7.3 架构
-
-```
-EdgeWorker (GPU 0)
-    │
-    ├── SplitEngine (训练用, ~2GB)
-    │       ├── front_layers + LoRA
-    │       └── tail_layers + LoRA
-    │
-    └── vLLM Rollout (推理用, ~6GB for 3B)
-            └── 完整 Qwen2.5-3B (或只放 front+tail+moved_middle)
-
-CenterWorker (GPU 1)
-    └── middle_layers (冻结, ~4GB, 训练和推理共用)
-```
-
-### 7.4 权重同步
-
-训练每 N 步后, 把 edge worker 的 LoRA adapter 同步到 vLLM:
-
-```python
-# 方案 A: LoRA adapter 同步 (推荐)
-# edge worker 保存 LoRA state_dict → vLLM 加载 LoRA
-vllm_worker.load_lora(lora_state_dict)
-
-# 方案 B: 完整权重合并 (更重)
-# edge worker 合并 LoRA → 完整模型权重 → vLLM 更新
-model.merge_and_unload()  # PEFT 合并
-vllm_worker.update_weights(full_state_dict)
-```
-
-方案 A 更轻量, 方案 B 在 vLLM 不支持 LoRA hot-swap 时使用。
-
-### 7.5 注意事项
-
-- vLLM 和 SplitEngine 共享 GPU 0 显存, 需要仔细分配
-- 3B 模型: SplitEngine ~2GB + vLLM ~6GB ≈ 8GB < 24GB (4090), 可行
-- 7B 模型: SplitEngine ~3GB + vLLM ~14GB ≈ 17GB < 24GB, 勉强可行
-- 更大模型需要考虑 time-sharing (训练时卸载 vLLM, 推理时卸载 SplitEngine)
-
----
-
-## 8. 阶段 4：生产化
-
-### 8.1 Checkpoint 适配
-
-实现 `SplitCheckpointEngine`:
-
-```python
-class SplitCheckpointEngine:
-    def save(self, local_path, global_step, edge_worker, center_worker):
-        # edge: 保存 LoRA state_dict + optimizer
-        # center: 不需要保存 (middle 冻结)
-        # 兼容 verl 的 checkpoint 目录结构
-
-    def load(self, local_path, edge_worker, center_worker):
-        # 加载 LoRA state_dict + optimizer
-```
-
-### 8.2 容错
-
-- 利用 Ray 的 Actor 自动重启能力
-- CenterWorker 崩溃 → Ray 重启 → 重新加载 middle_layers → 重新建立 NCCL
-- EdgeWorker 崩溃 → Ray 重启 → 重新加载 front/tail → 从 checkpoint 恢复
-
-### 8.3 多机扩展
+命令：
 
 ```bash
-# 机器 0: EdgeWorker + vLLM
-ray start --head --port=6379
-
-# 机器 1: CenterWorker
-ray start --address=机器0_IP:6379
-
-# NCCL init_method 从 env:// 改为 tcp://
+torchrun --nproc_per_node=2 -m verl.experimental.split_demo_v3.main_split_v3
 ```
 
-### 8.4 监控集成
+通过标准：
 
-复用 verl 的 Metric 系统:
+- 完成 10 个 GRPO step。
+- checkpoint 保存成功。
+- rank0 LoRA 参数收到梯度。
+- rank1 middle 参数保持冻结。
+- metrics 记录到 `STATUS.md`。
 
-- GPU 显存: verl 的 `log_gpu_memory_usage`
-- 训练指标: verl 的 `compute_data_metrics`
-- NCCL 传输量: 自定义 metric
+### Phase 1：SplitEngine 规范路径
+
+目标：Engine 方法成为训练/推理的规范边界。
+
+工作：
+
+- 至少有一条 smoke path 使用 `train_batch`。
+- `infer_batch` 能在 no-grad 下计算 logits/log_probs。
+- rank1 永远不作为 output rank 返回 logits/metrics。
+
+通过标准：
+
+- 直接 loop 和 `SplitEngine.train_batch` 的 loss 量级一致。
+- `is_mp_src_rank_with_outputs()` 只在 rank0 为 true。
+
+### Phase 2：DataProto 兼容
+
+目标：匹配 veRL 数据容器预期。
+
+工作：
+
+- 在 Engine 边界增加 DataProto normalization。
+- 文档化支持的 key。
+- 保留 TensorDict 路径用于 debug。
+
+通过标准：
+
+- 同一个 batch 下，TensorDict 和 DataProto 输入得到相同 logits/loss。
+- GRPO advantage / dynamic sampling 所需输入可通过 DataProto 承载。
+
+### Phase 3：Checkpoint Load 验证
+
+目标：checkpoint 不只是能保存，还能恢复。
+
+工作：
+
+- 训练后保存。
+- 重新创建 engine。
+- 加载 checkpoint。
+- 继续训练 1 step。
+
+通过标准：
+
+- 加载后的 adapter state 与保存的 trainable state 匹配。
+- optimizer state 成功加载。
+- 恢复后的 step 能完成。
+
+### Phase 4：文档化 veRL Worker 映射
+
+目标：说明 v3 如何位于 veRL worker 体系下，而不强行要求完整 RayPPOTrainer 集成。
+
+工作：
+
+- 文档化 `TrainingWorker -> SplitEngine`。
+- 文档化 rank0 collect 行为。
+- 文档化 rank1 service 行为。
+- 文档化 no-ref / no-critic 假设。
+
+通过标准：
+
+- `PLAN.md` 和 `STATUS.md` 对主线文件与非主线文件的描述一致。
+
+### Phase 5：冻结 v4 复用边界
+
+目标：v4 可以从稳定迁移图开始。
+
+工作：
+
+- 冻结 front/middle/tail role responsibilities。
+- 冻结 transport responsibilities。
+- 冻结 checkpoint metadata fields。
+
+通过标准：
+
+- v4 `PLAN.md` 可以引用 v3 组件，而不依赖 Ray 实验路径。
 
 ---
 
-## 9. 关键设计决策
+## 10. v4 迁移契约
 
-### 9.1 EdgeWorker 是否继承 Worker
+v4 不应该重写 veRL-facing interface。v4 应替换内部 computation flow。
 
-**决定**: 是。
+### 10.1 应保持稳定的接口
 
-原因: verl 的 `Worker` 基类提供 rank/world_size 管理、`@register` 装饰器、dispatch/collect 机制。继承后可以直接被 `RayWorkerGroup` 管理。
+```text
+DataProto in
+train_batch / infer_batch
+metrics out
+save_checkpoint / load_checkpoint
+rank with outputs
+```
 
-### 9.2 SplitEngine 是否支持 FSDP
+### 10.2 会变化的运行时
 
-**决定**: 阶段 2 不支持, 阶段 4 再考虑。
+v3：
 
-原因: FSDP 和层间拆分范式冲突。对于 <7B 模型, LoRA 足够。更大模型需要考虑:
-- 对 front/tail 的 LoRA 参数局部 FSDP (自定义 process_group)
-- 或者引入 Megatron 的 pipeline parallel 替代手工 split
+```text
+rank0 edge -> rank1 middle -> rank0 edge
+```
 
-### 9.3 NCCL 连接方式
+v4：
 
-**决定**: 使用 verl 的 `initialize_global_process_group_ray`。
+```text
+Head stage -> Middle stage 1 -> ... -> Middle stage N -> Tail stage
+```
 
-原因: verl 已经处理了 Ray 环境下的 NCCL 初始化, 包括获取 node IP、分配端口等。
+### 10.3 未来 v4 硬件目标
 
-### 9.4 数据协议
+示例：
 
-**决定**: 使用 DataProto, 但在 split 的 forward_backward_batch 中做内部转换。
+```text
+Machine 1: 4 x A800
+  GPU0-1: Head stage
+  GPU2-3: Tail stage
 
-原因: 与 verl 生态兼容。DataProto → 内部 tensor → NCCL 通信 → 内部 tensor → DataProto。
+Machine 2: 8 x A800
+  GPU0-1: Middle stage 1
+  GPU2-3: Middle stage 2
+  GPU4-5: Middle stage 3
+  GPU6-7: Middle stage 4
+```
+
+v4 plan 应按以下顺序推进：
+
+1. 2-stage topology abstraction，复现 v3。
+2. 3-stage Head/Middle/Tail。
+3. N-stage single-GPU pipeline。
+4. multi-node single-GPU-per-stage。
+5. two-GPU-per-stage。
+6. Ray control-plane orchestration。
+7. vLLM rollout and adapter sync。
 
 ---
 
-## 10. 风险与缓解
+## 11. 风险与缓解
 
 | 风险 | 严重性 | 缓解 |
-|---|---|---|
-| FSDP 和 split 冲突 | 高 | 阶段 2 不用 FSDP, 阶段 4 引入局部 FSDP |
-| vLLM 和 split 共享显存不足 | 中 | time-sharing 或增大 GPU |
-| NCCL 连接在 Ray 环境下失败 | 中 | 复用 verl 的 NCCL init, 有成熟的 fallback |
-| BaseEngine 接口不完全适配 | 中 | 只实现必要方法, 其他抛 NotImplementedError |
-| 梯度传递在 Ray 环境下异常 | 低 | v2 已验证 NCCL 梯度传递正确, Ray 不改变这一点 |
+|---|---:|---|
+| Ray backward deadlock 分散 v3 注意力 | high | Ray 保留为非主线实验 |
+| DataProto mismatch 引入隐蔽错误 | high | 做 TensorDict/DataProto 等价测试 |
+| Engine 路径与手写 loop 分叉 | high | 让 `train_batch` smoke path 成为规范路径 |
+| Middle backward 返回错误梯度 | high | 保留 v2 梯度检查并比较 trainable grads |
+| checkpoint 只保存但不能恢复 | medium | 增加 load-and-continue 验证 |
+| v3 过度绑定 2-rank 名字 | medium | 文档化 stage migration map，避免新增硬编码 rank 名 |
+| 过早集成 vLLM 分散重点 | medium | 等 split engine 接口稳定后再做 |
 
 ---
 
-## 11. 附录：verl 接口参考
+## 12. v3 完成标准
 
-### Worker 基类
+满足以下所有条件后，v3 才算完成：
 
-```python
-# verl/single_controller/base/worker.py
-class Worker(WorkerHelper):
-    @property
-    def rank(self) -> int
-    @property
-    def world_size(self) -> int
+- `torchrun --nproc_per_node=2 -m verl.experimental.split_demo_v3.main_split_v3` 完成 10 个 GRPO step。
+- `SplitEngine.train_batch` 和 `SplitEngine.infer_batch` 可作为 public engine methods 使用。
+- Engine 边界同时支持 DataProto 和 TensorDict 输入。
+- checkpoint save/load/resume 已验证。
+- rank0 是唯一 output rank。
+- rank1 是 frozen middle layers 的 service rank。
+- Ray Actor backward 被文档化为非主线问题。
+- v4 migration map 已文档化，且不依赖 Ray 双 Actor runtime。
 
-    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
-    def method(self, ...): ...
-
-    _register_dispatch_collect_info(mesh_name, dp_rank, is_collect)
-```
-
-### BaseEngine 接口
-
-```python
-# verl/workers/engine/base.py
-class BaseEngine:
-    def initialize(self)
-    def forward_backward_batch(self, data, loss_fn, forward_only=False)
-    def train_batch(self, data, loss_fn)
-    def infer_batch(self, data, loss_fn=None)
-    def save_checkpoint(self, local_path, hdfs_path, global_step, max_ckpt_to_keep)
-    def load_checkpoint(self, local_path, hdfs_path, del_local_after_load)
-    def to(self, device, model=True, optimizer=True, grad=True)
-    def get_data_parallel_size(self)
-    def get_data_parallel_rank(self)
-    def get_data_parallel_group(self)
-    def is_mp_src_rank_with_outputs(self)
-    def optimizer_zero_grad(self)
-    def optimizer_step(self)
-    def lr_scheduler_step(self)
-```
-
-### EngineRegistry
-
-```python
-# verl/workers/engine/base.py
-class EngineRegistry:
-    _engines = {}
-
-    @classmethod
-    def register(cls, model_type, backend, device="cuda"):
-        """装饰器, 注册引擎。"""
-
-    @classmethod
-    def new(cls, model_type, backend, *args, **kwargs):
-        """创建引擎实例。"""
-```
-
-### DataProto
-
-```python
-# verl/protocol.py
-class DataProto:
-    batch: TensorDict          # 张量数据
-    non_tensor_batch: dict     # 非张量数据
-    meta_info: dict            # 元信息
-
-    @staticmethod
-    def from_single_dict(data)
-    def select_idxs(self, indices)
-    def chunk(self, chunks)
-```
+完成这些后，v4 工程可以在不推倒 v3 的前提下开始。
