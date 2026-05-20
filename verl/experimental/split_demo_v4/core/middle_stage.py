@@ -1,4 +1,4 @@
-"""MiddleStage — 冻结的中间 stage，响应 Head 和 Tail 的请求。"""
+"""MiddleStage — 冻结的中间 stage，响应 Head 的请求并转发给 Tail。"""
 
 from __future__ import annotations
 
@@ -6,18 +6,17 @@ import torch
 import torch.distributed as dist
 from torch import Tensor, nn
 
-from .transport import FWD_ONLY, FWD_WITH_BWD, SHUTDOWN
+from .transport import FWD_ONLY, FWD_WITH_BWD, SHUTDOWN, PIPELINE_DONE, _DTYPE_MAP
 
 
 class MiddleStage:
-    """Middle stage: 冻结的 middle_layers，纯请求响应循环。"""
+    """Middle stage: 冻结的 middle_layers，Head→Tail 转发循环。"""
 
     def __init__(self, layers, rotary_emb, device):
         self.layers = nn.ModuleList(layers)
         self.rotary_emb = rotary_emb
         self.device = torch.device(device)
 
-        # 冻结所有参数
         for p in self.layers.parameters():
             p.requires_grad = False
         if self.rotary_emb is not None:
@@ -48,60 +47,69 @@ class MiddleStage:
     def _send_tensor(self, tensor, dst):
         dist.send(tensor.contiguous(), dst=dst)
 
-    def _recv_int(self, src):
-        t = torch.zeros(1, dtype=torch.int64, device=self.device)
-        dist.recv(t, src=src)
-        return t.item()
-
     def run(self):
-        """请求响应循环。从前一个 stage 接收，处理后发给下一个 stage。"""
-        prev_rank = 0  # Head
-        next_rank = 2  # Tail
+        """转发循环: 从 Head 接收 header+data，原样转发给 Tail。"""
+        head_rank = 0
+        tail_rank = 2
 
         while True:
-            # 从 Head 接收 header
-            flag = self._recv_int(prev_rank)
+            # 从 Head 接收 header（6-int tensor）
+            header = torch.zeros(6, dtype=torch.int64, device=self.device)
+            dist.recv(header, src=head_rank)
+            flag = int(header[0].item())
+
             if flag == SHUTDOWN:
                 break
 
-            B = self._recv_int(prev_rank)
-            S = self._recv_int(prev_rank)
-            H = self._recv_int(prev_rank)
-            has_pos_ids = self._recv_int(prev_rank)
-            has_mask = self._recv_int(prev_rank)
-            dtype_code = self._recv_int(prev_rank)
-            tensor_dtype = {0: torch.bfloat16, 1: torch.float16, 2: torch.float32}[dtype_code]
+            # 原样转发 header 给 Tail
+            dist.send(header.clone(), dst=tail_rank)
 
-            # 从 Head 接收数据
-            h_in = self._recv_tensor((B, S, H), tensor_dtype, prev_rank)
-            position_ids = self._recv_tensor((B, S), torch.int64, prev_rank) if has_pos_ids else None
-            attention_mask = self._recv_tensor((B, 1, S, S), tensor_dtype, prev_rank) if has_mask else None
+            if flag == PIPELINE_DONE:
+                continue
 
-            # 本地重算 pos_emb
+            # 转发 h + pos_ids + mask
+            B, S, H, has_mask, dtype_code = [int(x) for x in header[1:].tolist()]
+            tensor_dtype = _DTYPE_MAP[dtype_code]
+            h = self._recv_tensor((B, S, H), tensor_dtype, head_rank)
+            pos_ids = self._recv_tensor((B, S), torch.int64, head_rank)
+            if has_mask:
+                mask = self._recv_tensor((B, 1, S, S), tensor_dtype, head_rank)
+            else:
+                mask = None
+
+            # 重算 position_embeddings
             pos_emb = None
-            if self.rotary_emb is not None and position_ids is not None:
+            if self.rotary_emb is not None:
                 try:
-                    pos_emb = self.rotary_emb(h_in, position_ids)
+                    pos_emb = self.rotary_emb(h, pos_ids)
                 except TypeError:
-                    pos_emb = self.rotary_emb(h_in, seq_len=S)
+                    pos_emb = self.rotary_emb(h, seq_len=S)
 
             if flag == FWD_ONLY:
+                # 推理模式：经过 Middle 层计算（但不需要梯度）
                 with torch.no_grad():
-                    h_out = self.forward(h_in, position_ids=position_ids,
-                                       position_embeddings=pos_emb, attention_mask=attention_mask)
-                # 发给 Tail
-                self._send_tensor(h_out, next_rank)
+                    pos_emb = None
+                    if self.rotary_emb is not None:
+                        try:
+                            pos_emb = self.rotary_emb(h, pos_ids)
+                        except TypeError:
+                            pos_emb = self.rotary_emb(h, seq_len=S)
+                    h_out = self.forward(h, position_ids=pos_ids,
+                                       position_embeddings=pos_emb, attention_mask=mask)
+                self._send_tensor(h_out, tail_rank)
+                self._send_tensor(pos_ids, tail_rank)
 
             elif flag == FWD_WITH_BWD:
-                h_in_detached = h_in.detach().requires_grad_(True)
-                h_out = self.forward(h_in_detached, position_ids=position_ids,
-                                   position_embeddings=pos_emb, attention_mask=attention_mask)
-                # 发给 Tail
-                self._send_tensor(h_out.detach(), next_rank)
+                # 训练用：经过 Middle 层计算，保留计算图用于反向
+                h_in = h.detach().requires_grad_(True)
+                h_out = self.forward(h_in, position_ids=pos_ids,
+                                   position_embeddings=pos_emb, attention_mask=mask)
+                self._send_tensor(h_out.detach(), tail_rank)
+                self._send_tensor(pos_ids, tail_rank)
 
-                # 等 Tail 的 grad 回来
-                grad_out = self._recv_tensor(h_out.shape, h_out.dtype, next_rank)
+                # 从 Tail 接收 grad_h_out
+                grad_out = self._recv_tensor(h_out.shape, h_out.dtype, tail_rank)
+                # 反向传播
                 torch.autograd.backward(h_out, grad_out)
-
-                # 把 grad 发给 Head
-                self._send_tensor(h_in_detached.grad, prev_rank)
+                # 把 grad_h_in 发给 Head
+                self._send_tensor(h_in.grad, head_rank)

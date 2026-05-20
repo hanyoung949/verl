@@ -15,7 +15,7 @@ from tensordict import TensorDict
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 import importlib.util as _ilu
-_spec = _ilu.spec_from_file_location("_verl_engine_base", "/root/workspace/dev/verl/verl/workers/engine/base.py")
+_spec = _ilu.spec_from_file_location("_verl_engine_base", "/root/workspace/verl/verl/workers/engine/base.py")
 _mod = _ilu.module_from_spec(_spec)
 _spec.loader.exec_module(_mod)
 BaseEngine = _mod.BaseEngine
@@ -91,7 +91,9 @@ class SplitPipelineEngine(BaseEngine):
         embed_tokens, layers, rotary_emb, norm, lm_head = self._load_model_parts()
 
         if self.is_head:
-            self.stage = HeadStage(embed_tokens, layers[:self.front_end], rotary_emb, "cuda")
+            head_layers = [l.to("cuda") for l in layers[:self.front_end]]
+            self.stage = HeadStage(embed_tokens.to("cuda"), head_layers,
+                                   rotary_emb.to("cuda") if rotary_emb is not None else None, "cuda")
             self.transport = StageTransport(0, 1, "cuda")
             self.tokenizer = AutoTokenizer.from_pretrained(self._resolve_model_path(self.model_path))
             if self.tokenizer.pad_token is None:
@@ -99,12 +101,17 @@ class SplitPipelineEngine(BaseEngine):
             print(f"[rank{self.rank}] HeadStage: {len(self.stage.layers)} layers", flush=True)
 
         elif self.is_middle:
-            self.stage = MiddleStage(layers[self.front_end:self.middle_end], rotary_emb, "cuda")
+            mid_layers = [l.to("cuda") for l in layers[self.front_end:self.middle_end]]
+            self.stage = MiddleStage(mid_layers,
+                                     rotary_emb.to("cuda") if rotary_emb is not None else None, "cuda")
             print(f"[rank{self.rank}] MiddleStage: {len(self.stage.layers)} layers", flush=True)
 
         elif self.is_tail:
-            self.stage = TailStage(layers[self.middle_end:], norm, lm_head, "cuda",
-                                  lr=self.lr, clip_grad=self.clip_grad)
+            tail_layers = [l.to("cuda") for l in layers[self.middle_end:]]
+            self.stage = TailStage(tail_layers, norm.to("cuda"), lm_head.to("cuda"), "cuda",
+                                  lr=self.lr, clip_grad=self.clip_grad,
+                                  rotary_emb=rotary_emb.to("cuda") if rotary_emb is not None else None)
+            self.transport = StageTransport(2, 1, "cuda")
             self.tokenizer = AutoTokenizer.from_pretrained(self._resolve_model_path(self.model_path))
             if self.tokenizer.pad_token is None:
                 self.tokenizer.pad_token = self.tokenizer.eos_token
@@ -126,14 +133,12 @@ class SplitPipelineEngine(BaseEngine):
         with ctx:
             h, pos_ids, pos_emb, mask = self.stage.forward_input(input_ids, attention_mask)
 
-            # 发给 Middle: header + h + pos_ids + mask
+            # 发给 Middle: header(6-int tensor) + h + pos_ids + [mask]
             flag = FWD_ONLY if forward_only else FWD_WITH_BWD
             B, S, H = h.shape
-            has_pos = 1
             has_mask = 0 if mask is None else 1
-            dtype_code = 0  # bfloat16
-            for val in [flag, B, S, H, has_pos, has_mask, dtype_code]:
-                self.transport.send_int(val)
+            header = torch.tensor([flag, B, S, H, has_mask, 0], dtype=torch.int64, device="cuda")
+            self.transport.send(header)
             self.transport.send(h)
             self.transport.send(pos_ids)
             if mask is not None:
@@ -143,22 +148,38 @@ class SplitPipelineEngine(BaseEngine):
                 # 等 Middle 的 grad 回来
                 grad_h = self.transport.recv(h.shape, h.dtype)
                 h.backward(grad_h)
+            else:
+                # 接收 Tail 返回的 logits
+                result_shape = torch.zeros(2, dtype=torch.int64, device="cuda")
+                dist.recv(result_shape, src=2)
+                logits = torch.empty(result_shape[0].item(), result_shape[1].item(), 151936,
+                                    dtype=torch.bfloat16, device="cuda")
+                dist.recv(logits, src=2)
+                return {"logits": logits}
 
         return {}
 
     def _tail_forward_backward(self, data, loss_function, forward_only):
-        # 从 Middle 接收 h_middle
-        B = self.transport.recv_int()
-        S = self.transport.recv_int()
-        H = self.transport.recv_int()
-        dtype_code = self.transport.recv_int()
+        # 从 Middle 接收 header
+        header = torch.zeros(6, dtype=torch.int64, device="cuda")
+        dist.recv(header, src=1)
+        _flag, B, S, H, _has_mask, dtype_code = [int(x) for x in header.tolist()]
         tensor_dtype = {0: torch.bfloat16, 1: torch.float16, 2: torch.float32}[dtype_code]
         h_middle = self.transport.recv((B, S, H), tensor_dtype)
+        pos_ids = self.transport.recv((B, S), torch.int64)
+
+        # 用 Tail 自己的 rotary_emb 重算 position_embeddings
+        pos_emb = None
+        if self.stage.rotary_emb is not None:
+            try:
+                pos_emb = self.stage.rotary_emb(h_middle.to("cuda"), pos_ids.to("cuda"))
+            except TypeError:
+                pos_emb = self.stage.rotary_emb(h_middle.to("cuda"), seq_len=S)
 
         ctx = torch.no_grad() if forward_only else nullcontext()
         with ctx:
             h_in = h_middle if forward_only else h_middle.detach().requires_grad_(True)
-            logits = self.stage.forward_output(h_in)
+            logits = self.stage.forward_output(h_in, position_ids=pos_ids, position_embeddings=pos_emb)
 
             loss = None
             metrics = {}
@@ -172,7 +193,7 @@ class SplitPipelineEngine(BaseEngine):
 
             if not forward_only and loss is not None:
                 loss.backward()
-                # 把 grad 发给 Middle
+                # 把 grad 发给 Middle（Middle 再转发给 Head）
                 self.transport.send(h_in.grad)
 
         result = {"logits": logits.detach(), "metrics": metrics}

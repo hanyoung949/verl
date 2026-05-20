@@ -108,18 +108,27 @@ class HeadStage(Stage):
 class TailStage(Stage):
     """Tail stage: 包含 tail_layers + norm + lm_head + optimizer。"""
 
-    def __init__(self, layers, norm, lm_head, device, lr=1e-4, clip_grad=1.0):
+    def __init__(self, layers, norm, lm_head, device, lr=1e-4, clip_grad=1.0, rotary_emb=None):
         super().__init__("tail", layers, device, trainable=True)
         self.norm = norm
         self.lm_head = lm_head
+        self.rotary_emb = rotary_emb
         self.optimizer = torch.optim.AdamW(self.trainable_parameters(), lr=lr)
         self.clip_grad = clip_grad
 
-    def forward_output(self, h, **kwargs):
+    def forward_output(self, h, position_ids=None, position_embeddings=None, attention_mask=None, **kwargs):
         """从 middle 输出继续前向，返回 logits。"""
         h = h.to(self.device)
+        if position_embeddings is None and position_ids is not None and self.rotary_emb is not None:
+            try:
+                position_embeddings = self.rotary_emb(h, position_ids)
+            except TypeError:
+                position_embeddings = self.rotary_emb(h, seq_len=h.size(1))
         for layer in self.layers:
-            h = self._call_layer(layer, h, **kwargs)
+            h = self._call_layer(layer, h,
+                               position_ids=position_ids,
+                               position_embeddings=position_embeddings,
+                               attention_mask=attention_mask)
         h = self.norm(h)
         return self.lm_head(h)
 

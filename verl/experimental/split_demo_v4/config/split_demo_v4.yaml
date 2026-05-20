@@ -1,5 +1,5 @@
 model:
-  path: "~/share/Qwen2.5-3B-Instruct"
+  path: "/root/share/models/Qwen2.5-3B-Instruct"
 
 data:
   train_file: "verl/experimental/split_demo_v1/sample_data/train.jsonl"

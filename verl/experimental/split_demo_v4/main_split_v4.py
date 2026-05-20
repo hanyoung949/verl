@@ -25,7 +25,7 @@ from verl.trainer.ppo.core_algos import agg_loss, compute_grpo_outcome_advantage
 from verl.utils.torch_functional import logprobs_from_logits, masked_mean
 
 from .core.pipeline_engine import SplitPipelineEngine
-from .core.transport import SHUTDOWN
+from .core.transport import PIPELINE_DONE, SHUTDOWN
 from .reward import FunctionReward
 from .reward.function_reward import math_exact_match
 
@@ -58,7 +58,12 @@ def load_jsonl_samples(path):
 
 
 class SimplePipelineRollout:
-    """3-stage pipeline 的 rollout 包装。"""
+    """3-stage pipeline 的 rollout 包装。
+
+    通信路径:
+        Head → Middle → Tail（前向）
+        Tail → Head（logits 直接回传）
+    """
 
     def __init__(self, engine, tokenizer, temperature=1.0, top_p=1.0):
         self.engine = engine
@@ -86,15 +91,24 @@ class SimplePipelineRollout:
         return torch.multinomial(probs, num_samples=1)
 
     def _pipeline_forward(self, input_ids, attention_mask):
-        """通过 3-stage pipeline 做一次完整前向。"""
+        """Head→Middle→Tail 前向，Tail→Head 直接回传 logits。
+
+        协议（与 v3 对齐）:
+            Head → Middle: header(6-int tensor) + h + pos_ids + [mask]
+            Middle → Tail: header + h + pos_ids（原样转发）
+            Tail → Head:   logits 直接 dist.send
+        """
         if self.engine.is_head:
             h, pos_ids, pos_emb, mask = self.engine.stage.forward_input(input_ids, attention_mask)
-            # 发给 Middle
             B, S, H = h.shape
-            for val in [0, B, S, H, 0]:  # FWD_ONLY flag
-                self.engine.transport.send_int(val)
+            has_mask = 0 if mask is None else 1
+            header = torch.tensor([0, B, S, H, has_mask, 0], dtype=torch.int64, device="cuda")
+            self.engine.transport.send(header)
             self.engine.transport.send(h)
-            # 等 Tail 的 logits（Middle 会转发）
+            self.engine.transport.send(pos_ids)
+            if mask is not None:
+                self.engine.transport.send(mask)
+            # 从 Tail 直接收 logits
             result_shape = torch.zeros(2, dtype=torch.int64, device="cuda")
             dist.recv(result_shape, src=2)
             logits = torch.empty(result_shape[0].item(), result_shape[1].item(), 151936,
@@ -103,21 +117,27 @@ class SimplePipelineRollout:
             return logits
 
         elif self.engine.is_middle:
-            self.engine.stage.run()  # 不会返回
+            self.engine.stage.run()
             return None
 
         elif self.engine.is_tail:
-            # 从 Head 收 h（通过 Middle 转发，但 Middle 在 run 循环中直接转发）
-            # 实际上 Tail 直接收 Middle 转发的数据
-            B = self.engine.transport.recv_int()
-            S = self.engine.transport.recv_int()
-            H = self.engine.transport.recv_int()
-            dtype_code = self.engine.transport.recv_int()
+            # 从 Middle 接收转发的 header
+            header = torch.zeros(6, dtype=torch.int64, device="cuda")
+            dist.recv(header, src=1)
+            _flag, _B, S, H, _has_mask, dtype_code = [int(x) for x in header.tolist()]
             tensor_dtype = {0: torch.bfloat16, 1: torch.float16, 2: torch.float32}[dtype_code]
-            h_middle = self.engine.transport.recv((B, S, H), tensor_dtype)
+            h = self.engine.transport.recv((_B, S, H), tensor_dtype)
+            pos_ids = self.engine.transport.recv((_B, S), torch.int64)
+            # Tail 自己的 rotary_emb 重算 position_embeddings
+            pos_emb = None
+            if self.engine.stage.rotary_emb is not None:
+                try:
+                    pos_emb = self.engine.stage.rotary_emb(h.to("cuda"), pos_ids.to("cuda"))
+                except TypeError:
+                    pos_emb = self.engine.stage.rotary_emb(h.to("cuda"), seq_len=S)
             with torch.no_grad():
-                logits = self.engine.stage.forward_output(h_middle)
-            # 发给 Head
+                logits = self.engine.stage.forward_output(h, position_ids=pos_ids, position_embeddings=pos_emb)
+            # 直接发给 Head（不经过 Middle）
             dist.send(torch.tensor([logits.shape[0], logits.shape[1]], dtype=torch.int64, device="cuda"), dst=0)
             dist.send(logits, dst=0)
             return logits
@@ -179,6 +199,32 @@ class SimplePipelineRollout:
         return out
 
 
+def make_grpo_loss_fn(clip_low, clip_high, loss_agg_mode, loss_scale_factor):
+    """GRPO loss 函数，传给 engine.train_batch()。"""
+    def grpo_loss_fn(logits, data):
+        prompt_len = logits.shape[1] - data["response_ids"].shape[1]
+        log_prob_new = logprobs_from_logits(
+            logits[:, prompt_len - 1:-1, :], data["response_ids"])
+        neg_kl = torch.clamp(log_prob_new - data["old_log_probs"], min=-20.0, max=20.0)
+        ratio = neg_kl.exp()
+        adv = data["advantages"]
+        pg_losses = torch.maximum(
+            -adv * ratio,
+            -adv * ratio.clamp(1.0 - clip_low, 1.0 + clip_high),
+        )
+        loss = agg_loss(
+            loss_mat=pg_losses, loss_mask=data["response_mask"],
+            loss_agg_mode=loss_agg_mode, loss_scale_factor=loss_scale_factor)
+        approx_kl = masked_mean(-neg_kl, data["response_mask"])
+        clipped = (ratio.detach() < 1.0 - clip_low) | (ratio.detach() > 1.0 + clip_high)
+        clipfrac = masked_mean(clipped.float(), data["response_mask"])
+        return {
+            "loss": loss,
+            "metrics": {"approx_kl": approx_kl.detach().item(), "clipfrac": clipfrac.detach().item()},
+        }
+    return grpo_loss_fn
+
+
 @hydra.main(config_path="config", config_name="split_demo_v4", version_base=None)
 def main(config: DictConfig):
     dist.init_process_group(backend="nccl", timeout=timedelta(seconds=60))
@@ -216,6 +262,8 @@ def main(config: DictConfig):
     loss_scale_factor = int(config.algorithm.loss_scale_factor)
     log_freq = int(config.trainer.log_freq)
 
+    reward_fn = FunctionReward(fn=math_exact_match, tokenizer=tokenizer)
+
     rng = random.Random(int(config.trainer.seed))
 
     for global_step in range(1, total_steps + 1):
@@ -226,28 +274,179 @@ def main(config: DictConfig):
         encoded = tokenizer(prompts, padding=True, truncation=True,
                           max_length=int(config.data.max_prompt_length), return_tensors="pt")
 
-        # rollout
+        # ===== Phase 1: Pipeline forward (rollout) =====
         if engine.is_head:
-            # Head 做 rollout 生成
-            # 每次生成需要 Head → Middle → Tail → Head 的完整往返
             rollout = SimplePipelineRollout(engine, tokenizer)
-            rollout_output = rollout.generate(encoded["input_ids"], group_size, max_new_tokens, encoded["attention_mask"])
-            # 广播 rollout 结果给 Tail
-            if rollout_output is not None:
-                for name in ["sequences", "attention_mask", "response_ids", "response_mask"]:
-                    tensor = getattr(rollout_output, name)
-                    dist.broadcast(tensor, src=0)
-                dist.broadcast(torch.tensor([rollout_output.prompt_len], dtype=torch.int64, device="cuda"), src=0)
-        elif engine.is_tail:
-            # Tail 等 Head 的 rollout 结果
-            # 先让 Middle 启动
-            pass  # Middle 已经在 run() 中
+            rollout_output = rollout.generate(
+                encoded["input_ids"], group_size, max_new_tokens, encoded["attention_mask"])
+            header = torch.tensor([PIPELINE_DONE, 0, 0, 0, 0, 0], dtype=torch.int64, device="cuda")
+            engine.transport.send(header)
 
-    # 简化：v4 第一步先验证 3-stage 通信，不跑完整 GRPO
+        elif engine.is_tail:
+            while True:
+                header = torch.zeros(6, dtype=torch.int64, device="cuda")
+                dist.recv(header, src=1)
+                flag = int(header[0].item())
+                if flag == PIPELINE_DONE:
+                    break
+                _B, S, H_dim, _has_mask, dtype_code = [int(x) for x in header[1:].tolist()]
+                tensor_dtype = {0: torch.bfloat16, 1: torch.float16, 2: torch.float32}[dtype_code]
+                h = engine.transport.recv((_B, S, H_dim), tensor_dtype)
+                pos_ids = engine.transport.recv((_B, S), torch.int64)
+                pos_emb = None
+                if engine.stage.rotary_emb is not None:
+                    try:
+                        pos_emb = engine.stage.rotary_emb(h.to("cuda"), pos_ids.to("cuda"))
+                    except TypeError:
+                        pos_emb = engine.stage.rotary_emb(h.to("cuda"), seq_len=S)
+                with torch.no_grad():
+                    logits = engine.stage.forward_output(h, position_ids=pos_ids, position_embeddings=pos_emb)
+                dist.send(torch.tensor([logits.shape[0], logits.shape[1]], dtype=torch.int64, device="cuda"), dst=0)
+                dist.send(logits, dst=0)
+
+        # ===== Phase 2: Sync + Reward + old_log_prob + Advantage + Train =====
+        if engine.is_head and rollout_output is not None:
+            # 2a: Sync rollout results to Tail
+            for name in ["sequences", "attention_mask", "response_ids", "response_mask"]:
+                tensor = getattr(rollout_output, name)
+                shape_t = torch.tensor(list(tensor.shape), dtype=torch.int64, device="cuda")
+                dist.send(shape_t, dst=2)
+                dist.send(tensor.contiguous(), dst=2)
+            dist.send(torch.tensor([rollout_output.prompt_len], dtype=torch.int64, device="cuda"), dst=2)
+
+            # 2b: Reward
+            repeated_answers = [a for a in answers for _ in range(group_size)]
+            rewards = reward_fn.score(
+                rollout_output.sequences, rollout_output.attention_mask,
+                {"answers": repeated_answers, "prompt_len": rollout_output.prompt_len})
+            resp_texts = tokenizer.batch_decode(rollout_output.response_ids[:4], skip_special_tokens=True)
+            print(f"[step {global_step}] reward={rewards.mean().item():.4f} samples={resp_texts}", flush=True)
+
+            # 2c: old_log_prob — re-run forward on full sequences
+            logits_full = rollout._pipeline_forward(
+                rollout_output.sequences, rollout_output.attention_mask)
+            old_log_prob = logprobs_from_logits(
+                logits_full[:, rollout_output.prompt_len - 1:-1, :],
+                rollout_output.response_ids)
+            # signal Tail end of old_log_prob forward
+            header = torch.tensor([PIPELINE_DONE, 0, 0, 0, 0, 0], dtype=torch.int64, device="cuda")
+            engine.transport.send(header)
+            print(f"[step {global_step}] old_log_prob mean={old_log_prob.mean().item():.4f}", flush=True)
+
+            # 2d: Advantage
+            token_level_scores = torch.zeros_like(rollout_output.response_mask, dtype=torch.float32)
+            last_valid = rollout_output.response_mask.sum(dim=1).long() - 1
+            token_level_scores[torch.arange(token_level_scores.size(0), device="cuda"), last_valid] = rewards
+            rewards_grouped = rewards.view(batch_size, group_size)
+            if bool(config.algorithm.dynamic_sampling):
+                valid_groups = rewards_grouped.std(dim=1) > 1e-6
+            else:
+                valid_groups = torch.ones(batch_size, dtype=torch.bool, device="cuda")
+            if int(valid_groups.sum().item()) == 0:
+                print(f"[step {global_step}] all groups filtered, skip", flush=True)
+                continue
+            valid_seq = valid_groups.unsqueeze(1).expand(batch_size, group_size).reshape(-1)
+            uid_array = [f"g{pi}" for pi in range(batch_size) for _ in range(group_size)]
+            uid_valid = np.array(uid_array, dtype=object)[valid_seq.detach().cpu().numpy()]
+            advantages_valid, _ = compute_grpo_outcome_advantage(
+                token_level_rewards=token_level_scores[valid_seq],
+                response_mask=rollout_output.response_mask[valid_seq],
+                index=uid_valid,
+                norm_adv_by_std_in_grpo=bool(config.algorithm.norm_adv_by_std_in_grpo))
+            print(f"[step {global_step}] advantage mean={advantages_valid.mean().item():.4f} "
+                  f"valid={int(valid_groups.sum().item())}/{batch_size}", flush=True)
+
+            # 2e: Train — 先用 forward_only 验证通路，后续补 backward
+            grpo_loss_fn = make_grpo_loss_fn(
+                clip_low=float(config.algorithm.cliprange_low),
+                clip_high=float(config.algorithm.cliprange_high),
+                loss_agg_mode=str(config.algorithm.loss_agg_mode),
+                loss_scale_factor=loss_scale_factor)
+            train_data = TensorDict({
+                "input_ids": rollout_output.sequences[valid_seq],
+                "attention_mask": rollout_output.attention_mask[valid_seq],
+                "response_ids": rollout_output.response_ids[valid_seq],
+                "response_mask": rollout_output.response_mask[valid_seq],
+                "old_log_probs": old_log_prob[valid_seq],
+                "advantages": advantages_valid,
+            }, batch_size=[valid_seq.sum().item()])
+            # 用 infer_batch (forward_only) 代替 train_batch 测试通路
+            infer_result = engine.infer_batch(train_data)
+            logits_train = infer_result["logits"]
+            loss_output = grpo_loss_fn(logits_train, train_data)
+            loss_val = loss_output["loss"].item()
+            metrics = loss_output.get("metrics", {})
+            print(f"[step {global_step}] loss={loss_val:.4f} "
+                  f"approx_kl={metrics.get('approx_kl', 0):.4f} "
+                  f"clipfrac={metrics.get('clipfrac', 0):.4f}", flush=True)
+
+            # 通知 Tail 训练结束（通过 Middle 转发）
+            done_header = torch.tensor([PIPELINE_DONE, 0, 0, 0, 0, 0], dtype=torch.int64, device="cuda")
+            engine.transport.send(done_header)
+
+        elif engine.is_tail:
+            # 2a: Receive rollout results from Head
+            for _ in range(4):
+                shape_t = torch.zeros(2, dtype=torch.int64, device="cuda")
+                dist.recv(shape_t, src=0)
+                buf = torch.zeros(*[int(s) for s in shape_t.tolist()], dtype=torch.int64, device="cuda")
+                dist.recv(buf, src=0)
+            pl = torch.zeros(1, dtype=torch.int64, device="cuda")
+            dist.recv(pl, src=0)
+
+            # 2c: old_log_prob forward loop (matches Head's re-forward)
+            while True:
+                header = torch.zeros(6, dtype=torch.int64, device="cuda")
+                dist.recv(header, src=1)
+                flag = int(header[0].item())
+                if flag == PIPELINE_DONE:
+                    break
+                _B, S, H_dim, _has_mask, dtype_code = [int(x) for x in header[1:].tolist()]
+                tensor_dtype = {0: torch.bfloat16, 1: torch.float16, 2: torch.float32}[dtype_code]
+                h = engine.transport.recv((_B, S, H_dim), tensor_dtype)
+                pos_ids = engine.transport.recv((_B, S), torch.int64)
+                pos_emb = None
+                if engine.stage.rotary_emb is not None:
+                    try:
+                        pos_emb = engine.stage.rotary_emb(h.to("cuda"), pos_ids.to("cuda"))
+                    except TypeError:
+                        pos_emb = engine.stage.rotary_emb(h.to("cuda"), seq_len=S)
+                with torch.no_grad():
+                    logits = engine.stage.forward_output(h, position_ids=pos_ids, position_embeddings=pos_emb)
+                dist.send(torch.tensor([logits.shape[0], logits.shape[1]], dtype=torch.int64, device="cuda"), dst=0)
+                dist.send(logits, dst=0)
+
+            # 2d: Training forward+backward (Tail is the terminal stage for backward)
+            # Head's _head_forward_backward sends data, Tail computes loss+backward
+            while True:
+                header = torch.zeros(6, dtype=torch.int64, device="cuda")
+                dist.recv(header, src=1)
+                flag = int(header[0].item())
+                if flag == SHUTDOWN:
+                    break
+                if flag == PIPELINE_DONE:
+                    break
+                _B, S, H_dim, _has_mask, dtype_code = [int(x) for x in header[1:].tolist()]
+                tensor_dtype = {0: torch.bfloat16, 1: torch.float16, 2: torch.float32}[dtype_code]
+                h = engine.transport.recv((_B, S, H_dim), tensor_dtype)
+                pos_ids = engine.transport.recv((_B, S), torch.int64)
+                pos_emb = None
+                if engine.stage.rotary_emb is not None:
+                    try:
+                        pos_emb = engine.stage.rotary_emb(h.to("cuda"), pos_ids.to("cuda"))
+                    except TypeError:
+                        pos_emb = engine.stage.rotary_emb(h.to("cuda"), seq_len=S)
+                # Tail as terminal: forward_output + send logits detached
+                with torch.no_grad():
+                    logits = engine.stage.forward_output(h, position_ids=pos_ids, position_embeddings=pos_emb)
+                dist.send(torch.tensor([logits.shape[0], logits.shape[1]], dtype=torch.int64, device="cuda"), dst=0)
+                dist.send(logits, dst=0)
+
     print(f"[rank{rank}] v4 3-stage pipeline engine initialized", flush=True)
 
     if engine.is_head:
-        engine.transport.send_int(SHUTDOWN)
+        header = torch.tensor([SHUTDOWN, 0, 0, 0, 0, 0], dtype=torch.int64, device="cuda")
+        engine.transport.send(header)
 
     if dist.is_initialized():
         dist.destroy_process_group()

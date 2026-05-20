@@ -13,6 +13,7 @@ from torch import Tensor
 FWD_ONLY = 0
 FWD_WITH_BWD = 1
 SHUTDOWN = 2
+PIPELINE_DONE = 3
 
 _DTYPE_CODE = {
     torch.bfloat16: 0,
