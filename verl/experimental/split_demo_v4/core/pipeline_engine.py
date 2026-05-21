@@ -401,24 +401,30 @@ class SplitPipelineEngine(BaseEngine):
         pass
 
     def save_checkpoint(self, local_path, hdfs_path=None, global_step=0, max_ckpt_to_keep=None, **kwargs):
-        if not self.is_tail:
-            return
         target = Path(local_path)
         target.mkdir(parents=True, exist_ok=True)
-        torch.save(self.stage.get_trainable_state_dict(), target / "adapter_state.pt")
-        torch.save(self.stage.optimizer.state_dict(), target / "optimizer.pt")
-        meta = {"model_path": self.model_path, "front_end": self.front_end,
-                "middle_end": self.middle_end, "global_step": global_step}
-        (target / "adapter_meta.json").write_text(json.dumps(meta, indent=2))
+        if self.is_head:
+            torch.save(self.stage.get_trainable_state_dict(), target / "head_adapter_state.pt")
+            torch.save(self.stage.optimizer.state_dict(), target / "head_optimizer.pt")
+        elif self.is_tail:
+            torch.save(self.stage.get_trainable_state_dict(), target / "tail_adapter_state.pt")
+            torch.save(self.stage.optimizer.state_dict(), target / "tail_optimizer.pt")
+            meta = {"model_path": self.model_path, "front_end": self.front_end,
+                    "middle_end": self.middle_end, "global_step": global_step}
+            (target / "adapter_meta.json").write_text(json.dumps(meta, indent=2))
 
     def load_checkpoint(self, local_path, hdfs_path=None, del_local_after_load=True, **kwargs):
-        if not self.is_tail:
-            return
         target = Path(local_path)
-        state = torch.load(target / "adapter_state.pt", map_location="cuda")
-        self.stage.load_trainable_state_dict(state)
-        if (target / "optimizer.pt").exists():
-            self.stage.optimizer.load_state_dict(torch.load(target / "optimizer.pt", map_location="cuda"))
+        if self.is_head:
+            state = torch.load(target / "head_adapter_state.pt", map_location="cuda")
+            self.stage.load_trainable_state_dict(state)
+            if (target / "head_optimizer.pt").exists():
+                self.stage.optimizer.load_state_dict(torch.load(target / "head_optimizer.pt", map_location="cuda"))
+        elif self.is_tail:
+            state = torch.load(target / "tail_adapter_state.pt", map_location="cuda")
+            self.stage.load_trainable_state_dict(state)
+            if (target / "tail_optimizer.pt").exists():
+                self.stage.optimizer.load_state_dict(torch.load(target / "tail_optimizer.pt", map_location="cuda"))
 
 
 def _unwrap_causal_lm(model):

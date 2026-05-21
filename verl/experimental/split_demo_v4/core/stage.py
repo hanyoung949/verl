@@ -106,6 +106,18 @@ class HeadStage(Stage):
             params.extend(p for p in layer.parameters() if p.requires_grad)
         return params
 
+    def get_trainable_state_dict(self):
+        state = {}
+        for name, p in self.named_parameters():
+            if p.requires_grad:
+                state[name] = p.detach().cpu().clone()
+        return state
+
+    def load_trainable_state_dict(self, state):
+        for name, p in self.named_parameters():
+            if name in state:
+                p.data.copy_(state[name].to(p.device))
+
     def zero_grad(self):
         self.optimizer.zero_grad()
 
