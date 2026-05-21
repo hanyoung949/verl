@@ -25,7 +25,7 @@ from verl.trainer.ppo.core_algos import agg_loss, compute_grpo_outcome_advantage
 from verl.utils.torch_functional import logprobs_from_logits, masked_mean
 
 from .core.pipeline_engine import SplitPipelineEngine
-from .core.transport import PIPELINE_DONE, SHUTDOWN
+from .core.transport import FWD_ONLY, FWD_WITH_BWD, PIPELINE_DONE, SHUTDOWN, TRAIN_MB, TRAIN_DONE, STEP_SKIP, TRAIN_START
 from .reward import FunctionReward
 from .reward.function_reward import math_exact_match
 
@@ -90,57 +90,20 @@ class SimplePipelineRollout:
             return sorted_indices.gather(-1, sampled)
         return torch.multinomial(probs, num_samples=1)
 
-    def _pipeline_forward(self, input_ids, attention_mask):
-        """Head→Middle→Tail 前向，Tail→Head 直接回传 logits。
+    def _pipeline_forward(self, data):
+        """Head→Middle→Tail 前向，Tail 本地采样后回传 next_token + log_prob。
 
-        协议（与 v3 对齐）:
-            Head → Middle: header(6-int tensor) + h + pos_ids + [mask]
-            Middle → Tail: header + h + pos_ids（原样转发）
-            Tail → Head:   logits 直接 dist.send
+        通信量从 O(B*S*vocab) 降到 O(B)。
         """
         if self.engine.is_head:
-            h, pos_ids, pos_emb, mask = self.engine.stage.forward_input(input_ids, attention_mask)
-            B, S, H = h.shape
-            has_mask = 0 if mask is None else 1
-            header = torch.tensor([0, B, S, H, has_mask, 0], dtype=torch.int64, device="cuda")
-            self.engine.transport.send(header)
-            self.engine.transport.send(h)
-            self.engine.transport.send(pos_ids)
-            if mask is not None:
-                self.engine.transport.send(mask)
-            # 从 Tail 直接收 logits
-            result_shape = torch.zeros(2, dtype=torch.int64, device="cuda")
-            dist.recv(result_shape, src=2)
-            logits = torch.empty(result_shape[0].item(), result_shape[1].item(), 151936,
-                                dtype=torch.bfloat16, device="cuda")
-            dist.recv(logits, src=2)
-            return logits
+            result = self.engine.sample_next_token(data, temperature=self.temperature, pad_token_id=self.pad_token_id)
+            return result
 
         elif self.engine.is_middle:
             self.engine.stage.run()
             return None
 
-        elif self.engine.is_tail:
-            # 从 Middle 接收转发的 header
-            header = torch.zeros(6, dtype=torch.int64, device="cuda")
-            dist.recv(header, src=1)
-            _flag, _B, S, H, _has_mask, dtype_code = [int(x) for x in header.tolist()]
-            tensor_dtype = {0: torch.bfloat16, 1: torch.float16, 2: torch.float32}[dtype_code]
-            h = self.engine.transport.recv((_B, S, H), tensor_dtype)
-            pos_ids = self.engine.transport.recv((_B, S), torch.int64)
-            # Tail 自己的 rotary_emb 重算 position_embeddings
-            pos_emb = None
-            if self.engine.stage.rotary_emb is not None:
-                try:
-                    pos_emb = self.engine.stage.rotary_emb(h.to("cuda"), pos_ids.to("cuda"))
-                except TypeError:
-                    pos_emb = self.engine.stage.rotary_emb(h.to("cuda"), seq_len=S)
-            with torch.no_grad():
-                logits = self.engine.stage.forward_output(h, position_ids=pos_ids, position_embeddings=pos_emb)
-            # 直接发给 Head（不经过 Middle）
-            dist.send(torch.tensor([logits.shape[0], logits.shape[1]], dtype=torch.int64, device="cuda"), dst=0)
-            dist.send(logits, dst=0)
-            return logits
+        # Tail 分支不会走到这里：generate() 在 Tail rank 提前返回 None。
 
     def generate(self, prompt_ids, group_size, max_new_tokens, attention_mask=None):
         device = torch.device("cuda")
@@ -162,21 +125,33 @@ class SimplePipelineRollout:
         generated_masks = []
         finished = torch.zeros(prompt_ids.size(0), dtype=torch.bool, device=device)
 
-        prefill_logits = self._pipeline_forward(prompt_ids, attention_mask)
-        next_token = self._sample_next_token(prefill_logits[:, -1, :])
+        prefill_data = TensorDict({
+            "input_ids": prompt_ids,
+            "attention_mask": attention_mask,
+        }, batch_size=prompt_ids.shape[0])
+        prefill_result = self._pipeline_forward(prefill_data)
+        next_token = prefill_result["next_token"]
+        prefill_log_prob = prefill_result["log_prob"]
         current_valid = (~finished).float().unsqueeze(-1)
-        generated_tokens.append(next_token)
-        generated_masks.append(current_valid)
+        generated_tokens = [next_token]
+        generated_log_probs = [prefill_log_prob]
+        generated_masks = [current_valid]
         finished = finished | (next_token.squeeze(-1) == self.eos_token_id)
         current_ids = torch.cat([prompt_ids, next_token], dim=-1)
         current_mask = torch.cat([attention_mask, current_valid.long()], dim=-1)
 
         for _ in range(max_new_tokens - 1):
-            next_logits = self._pipeline_forward(current_ids, current_mask)
-            sampled = self._sample_next_token(next_logits[:, -1, :])
-            sampled = torch.where(finished.unsqueeze(-1), torch.full_like(sampled, self.pad_token_id), sampled)
+            decode_data = TensorDict({
+                "input_ids": current_ids,
+                "attention_mask": current_mask,
+                "finished": finished,
+            }, batch_size=current_ids.shape[0])
+            result = self._pipeline_forward(decode_data)
+            sampled = result["next_token"]
+            step_log_prob = result["log_prob"]
             current_valid = (~finished).float().unsqueeze(-1)
             generated_tokens.append(sampled)
+            generated_log_probs.append(step_log_prob)
             generated_masks.append(current_valid)
             finished = finished | (sampled.squeeze(-1) == self.eos_token_id)
             current_ids = torch.cat([current_ids, sampled], dim=-1)
@@ -185,6 +160,7 @@ class SimplePipelineRollout:
                 break
 
         response_ids = torch.cat(generated_tokens, dim=-1)
+        response_log_probs = torch.cat(generated_log_probs, dim=-1)
         response_mask = torch.cat(generated_masks, dim=-1).long()
         sequences = torch.cat([prompt_ids, response_ids], dim=-1)
         full_mask = torch.cat([attention_mask, response_mask], dim=-1)
@@ -195,8 +171,36 @@ class SimplePipelineRollout:
         out.attention_mask = full_mask
         out.response_ids = response_ids
         out.response_mask = response_mask
+        out.old_log_probs = response_log_probs
         out.prompt_len = prompt_len
         return out
+
+
+def _tail_forward_logits(engine, src_rank=1, dst_rank=0):
+    """Tail 从 Middle 接收 activation 并做无 grad 前向，返回 logits 和 flag。
+
+    抽取重复逻辑，减少协议修改时遗漏的风险。
+    """
+    header = torch.zeros(6, dtype=torch.int64, device="cuda")
+    dist.recv(header, src=src_rank)
+    flag = int(header[0].item())
+    if flag == PIPELINE_DONE:
+        return None, flag
+    _B, S, H_dim, _has_mask, dtype_code = [int(x) for x in header[1:].tolist()]
+    tensor_dtype = {0: torch.bfloat16, 1: torch.float16, 2: torch.float32}[dtype_code]
+    h = engine.transport.recv((_B, S, H_dim), tensor_dtype)
+    pos_ids = engine.transport.recv((_B, S), torch.int64)
+    pos_emb = None
+    if engine.stage.rotary_emb is not None:
+        try:
+            pos_emb = engine.stage.rotary_emb(h.to("cuda"), pos_ids.to("cuda"))
+        except TypeError:
+            pos_emb = engine.stage.rotary_emb(h.to("cuda"), seq_len=S)
+    with torch.no_grad():
+        logits = engine.stage.forward_output(h, position_ids=pos_ids, position_embeddings=pos_emb)
+    dist.send(torch.tensor([logits.shape[0], logits.shape[1], logits.shape[2]], dtype=torch.int64, device="cuda"), dst=dst_rank)
+    dist.send(logits, dst=dst_rank)
+    return logits, flag
 
 
 def make_grpo_loss_fn(clip_low, clip_high, loss_agg_mode, loss_scale_factor):
@@ -283,57 +287,41 @@ def main(config: DictConfig):
             engine.transport.send(header)
 
         elif engine.is_tail:
+            # Phase 1 rollout —— 统一走 engine.sample_next_token()
             while True:
-                header = torch.zeros(6, dtype=torch.int64, device="cuda")
-                dist.recv(header, src=1)
-                flag = int(header[0].item())
-                if flag == PIPELINE_DONE:
+                result = engine.sample_next_token(TensorDict({}, batch_size=[0]))
+                if not result or "next_token" not in result:
                     break
-                _B, S, H_dim, _has_mask, dtype_code = [int(x) for x in header[1:].tolist()]
-                tensor_dtype = {0: torch.bfloat16, 1: torch.float16, 2: torch.float32}[dtype_code]
-                h = engine.transport.recv((_B, S, H_dim), tensor_dtype)
-                pos_ids = engine.transport.recv((_B, S), torch.int64)
-                pos_emb = None
-                if engine.stage.rotary_emb is not None:
-                    try:
-                        pos_emb = engine.stage.rotary_emb(h.to("cuda"), pos_ids.to("cuda"))
-                    except TypeError:
-                        pos_emb = engine.stage.rotary_emb(h.to("cuda"), seq_len=S)
-                with torch.no_grad():
-                    logits = engine.stage.forward_output(h, position_ids=pos_ids, position_embeddings=pos_emb)
-                dist.send(torch.tensor([logits.shape[0], logits.shape[1]], dtype=torch.int64, device="cuda"), dst=0)
-                dist.send(logits, dst=0)
 
-        # ===== Phase 2: Sync + Reward + old_log_prob + Advantage + Train =====
+        # ===== Phase 2: Reward + old_log_prob + Advantage + Train =====
         if engine.is_head and rollout_output is not None:
             # 2a: Sync rollout results to Tail
-            for name in ["sequences", "attention_mask", "response_ids", "response_mask"]:
+            for name in ["response_ids", "response_mask"]:
                 tensor = getattr(rollout_output, name)
                 shape_t = torch.tensor(list(tensor.shape), dtype=torch.int64, device="cuda")
                 dist.send(shape_t, dst=2)
                 dist.send(tensor.contiguous(), dst=2)
             dist.send(torch.tensor([rollout_output.prompt_len], dtype=torch.int64, device="cuda"), dst=2)
 
-            # 2b: Reward
+            # 2b: 等 Tail 确认已收到 rollout results
+            tail_ready = torch.zeros(1, dtype=torch.int64, device="cuda")
+            dist.recv(tail_ready, src=2)
+
+            # 2c: old_log_prob（rollout 时已保存，无需 infer_batch 重算）
+            old_log_prob = rollout_output.old_log_probs
+
+            # 通知 Tail old_log_prob 阶段结束（协议对齐：Tail 仍需收 PIPELINE_DONE 才能进入训练）
+            header = torch.tensor([PIPELINE_DONE, 0, 0, 0, 0, 0], dtype=torch.int64, device="cuda")
+            engine.transport.send(header)
+
+            # 2d: Reward
             repeated_answers = [a for a in answers for _ in range(group_size)]
             rewards = reward_fn.score(
                 rollout_output.sequences, rollout_output.attention_mask,
                 {"answers": repeated_answers, "prompt_len": rollout_output.prompt_len})
-            resp_texts = tokenizer.batch_decode(rollout_output.response_ids[:4], skip_special_tokens=True)
-            print(f"[step {global_step}] reward={rewards.mean().item():.4f} samples={resp_texts}", flush=True)
+            print(f"[step {global_step}] reward={rewards.mean().item():.4f}", flush=True)
 
-            # 2c: old_log_prob — re-run forward on full sequences
-            logits_full = rollout._pipeline_forward(
-                rollout_output.sequences, rollout_output.attention_mask)
-            old_log_prob = logprobs_from_logits(
-                logits_full[:, rollout_output.prompt_len - 1:-1, :],
-                rollout_output.response_ids)
-            # signal Tail end of old_log_prob forward
-            header = torch.tensor([PIPELINE_DONE, 0, 0, 0, 0, 0], dtype=torch.int64, device="cuda")
-            engine.transport.send(header)
-            print(f"[step {global_step}] old_log_prob mean={old_log_prob.mean().item():.4f}", flush=True)
-
-            # 2d: Advantage
+            # 2d: token_level_scores + dynamic_sampling + advantage
             token_level_scores = torch.zeros_like(rollout_output.response_mask, dtype=torch.float32)
             last_valid = rollout_output.response_mask.sum(dim=1).long() - 1
             token_level_scores[torch.arange(token_level_scores.size(0), device="cuda"), last_valid] = rewards
@@ -344,6 +332,9 @@ def main(config: DictConfig):
                 valid_groups = torch.ones(batch_size, dtype=torch.bool, device="cuda")
             if int(valid_groups.sum().item()) == 0:
                 print(f"[step {global_step}] all groups filtered, skip", flush=True)
+                # 通知 Tail 跳过本轮训练，防止协议错位
+                skip_ctrl = torch.tensor([STEP_SKIP, 0], dtype=torch.int64, device="cuda")
+                dist.send(skip_ctrl, dst=2)
                 continue
             valid_seq = valid_groups.unsqueeze(1).expand(batch_size, group_size).reshape(-1)
             uid_array = [f"g{pi}" for pi in range(batch_size) for _ in range(group_size)]
@@ -356,37 +347,83 @@ def main(config: DictConfig):
             print(f"[step {global_step}] advantage mean={advantages_valid.mean().item():.4f} "
                   f"valid={int(valid_groups.sum().item())}/{batch_size}", flush=True)
 
-            # 2e: Train — 先用 forward_only 验证通路，后续补 backward
+            # 2e: 多 epoch × mini-batch 训练（优化：一次性同步完整训练数据给 Tail）
+            seq_v = rollout_output.sequences[valid_seq]
+            mask_v = rollout_output.attention_mask[valid_seq]
+            resp_ids_v = rollout_output.response_ids[valid_seq]
+            resp_mask_v = rollout_output.response_mask[valid_seq]
+            old_lp_v = old_log_prob[valid_seq]
+            n_valid = seq_v.size(0)
+
+            # 通知 Tail 开始接收训练数据
+            dist.send(torch.tensor([TRAIN_START, 0], dtype=torch.int64, device="cuda"), dst=2)
+
+            # 一次性发送完整训练数据给 Tail（response_ids, response_mask, old_log_probs, advantages）
+            tensors_to_send = [resp_ids_v, resp_mask_v, old_lp_v, advantages_valid]
+            for i, tensor in enumerate(tensors_to_send):
+                print(f"[step {global_step}] sending tensor {i}: {tensor.shape} {tensor.dtype}", flush=True)
+                shape_t = torch.tensor(list(tensor.shape), dtype=torch.int64, device="cuda")
+                dtype_map = {torch.float32: 0, torch.bfloat16: 1, torch.float16: 2, torch.int64: 3}
+                dtype_t = torch.tensor([dtype_map.get(tensor.dtype, 0)], dtype=torch.int64, device="cuda")
+                dist.send(shape_t, dst=2)
+                dist.send(dtype_t, dst=2)
+                dist.send(tensor.contiguous(), dst=2)
+            # 发 GRPO 配置
+            grpo_cfg = torch.tensor([
+                float(config.algorithm.cliprange_low),
+                float(config.algorithm.cliprange_high),
+                float(config.algorithm.loss_scale_factor),
+            ], dtype=torch.float32, device="cuda")
+            dist.send(grpo_cfg, dst=2)
+            print(f"[step {global_step}] full data + GRPO config sent", flush=True)
+
+            last_loss = last_clipfrac = last_approx_kl = 0.0
             grpo_loss_fn = make_grpo_loss_fn(
                 clip_low=float(config.algorithm.cliprange_low),
                 clip_high=float(config.algorithm.cliprange_high),
                 loss_agg_mode=str(config.algorithm.loss_agg_mode),
                 loss_scale_factor=loss_scale_factor)
-            train_data = TensorDict({
-                "input_ids": rollout_output.sequences[valid_seq],
-                "attention_mask": rollout_output.attention_mask[valid_seq],
-                "response_ids": rollout_output.response_ids[valid_seq],
-                "response_mask": rollout_output.response_mask[valid_seq],
-                "old_log_probs": old_log_prob[valid_seq],
-                "advantages": advantages_valid,
-            }, batch_size=[valid_seq.sum().item()])
-            # 用 infer_batch (forward_only) 代替 train_batch 测试通路
-            infer_result = engine.infer_batch(train_data)
-            logits_train = infer_result["logits"]
-            loss_output = grpo_loss_fn(logits_train, train_data)
-            loss_val = loss_output["loss"].item()
-            metrics = loss_output.get("metrics", {})
-            print(f"[step {global_step}] loss={loss_val:.4f} "
-                  f"approx_kl={metrics.get('approx_kl', 0):.4f} "
-                  f"clipfrac={metrics.get('clipfrac', 0):.4f}", flush=True)
 
-            # 通知 Tail 训练结束（通过 Middle 转发）
-            done_header = torch.tensor([PIPELINE_DONE, 0, 0, 0, 0, 0], dtype=torch.int64, device="cuda")
-            engine.transport.send(done_header)
+            for _epoch in range(update_epochs):
+                perm = torch.randperm(n_valid, device="cuda")
+                for _start in range(0, n_valid, mini_batch_size):
+                    mb = perm[_start:_start + mini_batch_size]
+
+                    # Step 1: Head 给 Tail 发 TRAIN_MB + mb indices（不再发完整 tensor）
+                    ctrl_header = torch.tensor([TRAIN_MB, mb.size(0)],
+                                             dtype=torch.int64, device="cuda")
+                    dist.send(ctrl_header, dst=2)
+                    dist.send(mb, dst=2)
+
+                    # Step 2: Head 调用 train_batch（统一 zero_grad / step 在 engine 内处理）
+                    mb_data = {
+                        "input_ids": seq_v[mb],
+                        "attention_mask": mask_v[mb],
+                        "response_ids": resp_ids_v[mb],
+                        "response_mask": resp_mask_v[mb],
+                        "old_log_probs": old_lp_v[mb],
+                        "advantages": advantages_valid[mb],
+                    }
+                    train_data = TensorDict(mb_data, batch_size=[mb.size(0)])
+                    engine.train_batch(train_data, grpo_loss_fn)
+                    # 从 Tail 接收 loss/metrics
+                    metrics_tensor = torch.zeros(3, dtype=torch.float32, device="cuda")
+                    dist.recv(metrics_tensor, src=2)
+                    last_loss = metrics_tensor[0].item()
+                    last_clipfrac = metrics_tensor[1].item()
+                    last_approx_kl = metrics_tensor[2].item()
+
+            # 训练结束
+            done_ctrl = torch.tensor([TRAIN_DONE, 0], dtype=torch.int64, device="cuda")
+            dist.send(done_ctrl, dst=2)
+
+            print(f"[step {global_step}] loss={last_loss:.4f} "
+                  f"approx_kl={last_approx_kl:.4f} "
+                  f"clipfrac={last_clipfrac:.4f}", flush=True)
 
         elif engine.is_tail:
-            # 2a: Receive rollout results from Head
-            for _ in range(4):
+            # 2a: Receive rollout results from Head (response_ids, response_mask + prompt_len)
+            for _ in range(2):
                 shape_t = torch.zeros(2, dtype=torch.int64, device="cuda")
                 dist.recv(shape_t, src=0)
                 buf = torch.zeros(*[int(s) for s in shape_t.tolist()], dtype=torch.int64, device="cuda")
@@ -394,54 +431,79 @@ def main(config: DictConfig):
             pl = torch.zeros(1, dtype=torch.int64, device="cuda")
             dist.recv(pl, src=0)
 
-            # 2c: old_log_prob forward loop (matches Head's re-forward)
-            while True:
-                header = torch.zeros(6, dtype=torch.int64, device="cuda")
-                dist.recv(header, src=1)
-                flag = int(header[0].item())
-                if flag == PIPELINE_DONE:
-                    break
-                _B, S, H_dim, _has_mask, dtype_code = [int(x) for x in header[1:].tolist()]
-                tensor_dtype = {0: torch.bfloat16, 1: torch.float16, 2: torch.float32}[dtype_code]
-                h = engine.transport.recv((_B, S, H_dim), tensor_dtype)
-                pos_ids = engine.transport.recv((_B, S), torch.int64)
-                pos_emb = None
-                if engine.stage.rotary_emb is not None:
-                    try:
-                        pos_emb = engine.stage.rotary_emb(h.to("cuda"), pos_ids.to("cuda"))
-                    except TypeError:
-                        pos_emb = engine.stage.rotary_emb(h.to("cuda"), seq_len=S)
-                with torch.no_grad():
-                    logits = engine.stage.forward_output(h, position_ids=pos_ids, position_embeddings=pos_emb)
-                dist.send(torch.tensor([logits.shape[0], logits.shape[1]], dtype=torch.int64, device="cuda"), dst=0)
-                dist.send(logits, dst=0)
+            # 2b: 先发 ready 给 Head，再进入 old_log_prob loop
+            # 顺序至关重要：必须先 ready，否则 Head 等 ready、Tail 等 infer_batch → 死锁
+            dist.send(torch.tensor([1], dtype=torch.int64, device="cuda"), dst=0)
 
-            # 2d: Training forward+backward (Tail is the terminal stage for backward)
-            # Head's _head_forward_backward sends data, Tail computes loss+backward
+            # old_log_prob forward loop —— 统一走 engine API
             while True:
-                header = torch.zeros(6, dtype=torch.int64, device="cuda")
-                dist.recv(header, src=1)
-                flag = int(header[0].item())
-                if flag == SHUTDOWN:
+                result = engine.forward_backward_batch(TensorDict({}, batch_size=[0]), None, forward_only=True)
+                if not result or "logits" not in result:
                     break
-                if flag == PIPELINE_DONE:
-                    break
-                _B, S, H_dim, _has_mask, dtype_code = [int(x) for x in header[1:].tolist()]
-                tensor_dtype = {0: torch.bfloat16, 1: torch.float16, 2: torch.float32}[dtype_code]
-                h = engine.transport.recv((_B, S, H_dim), tensor_dtype)
-                pos_ids = engine.transport.recv((_B, S), torch.int64)
-                pos_emb = None
-                if engine.stage.rotary_emb is not None:
-                    try:
-                        pos_emb = engine.stage.rotary_emb(h.to("cuda"), pos_ids.to("cuda"))
-                    except TypeError:
-                        pos_emb = engine.stage.rotary_emb(h.to("cuda"), seq_len=S)
-                # Tail as terminal: forward_output + send logits detached
-                with torch.no_grad():
-                    logits = engine.stage.forward_output(h, position_ids=pos_ids, position_embeddings=pos_emb)
-                dist.send(torch.tensor([logits.shape[0], logits.shape[1]], dtype=torch.int64, device="cuda"), dst=0)
-                dist.send(logits, dst=0)
 
+            # 2c: 接收 Head 的控制消息
+            ctrl = torch.zeros(2, dtype=torch.int64, device="cuda")
+            dist.recv(ctrl, src=0)
+            ctrl_flag = int(ctrl[0].item())
+            if ctrl_flag == STEP_SKIP:
+                # Head 通知本 step 跳过训练（dynamic_sampling 全过滤）
+                continue
+
+            # 一次性接收完整训练数据（response_ids, response_mask, old_log_probs, advantages）
+            train_cache = {}
+            for name in ["response_ids", "response_mask", "old_log_probs", "advantages"]:
+                shape_t = torch.zeros(2, dtype=torch.int64, device="cuda")
+                dist.recv(shape_t, src=0)
+                dtype_t = torch.zeros(1, dtype=torch.int64, device="cuda")
+                dist.recv(dtype_t, src=0)
+                dtype_map = {0: torch.float32, 1: torch.bfloat16, 2: torch.float16, 3: torch.int64}
+                buf = torch.empty(*[int(s) for s in shape_t.tolist()],
+                                dtype=dtype_map[int(dtype_t.item())], device="cuda")
+                dist.recv(buf, src=0)
+                train_cache[name] = buf
+
+            # 接收 GRPO 配置
+            grpo_cfg = torch.zeros(3, dtype=torch.float32, device="cuda")
+            dist.recv(grpo_cfg, src=0)
+            # Tail 和 Head 使用相同的 loss_agg_mode，避免配置不一致
+            tail_loss_fn = make_grpo_loss_fn(
+                clip_low=float(grpo_cfg[0].item()), clip_high=float(grpo_cfg[1].item()),
+                loss_agg_mode=str(config.algorithm.loss_agg_mode), loss_scale_factor=int(grpo_cfg[2].item()))
+            print(f"[Tail] full data received, entering training loop", flush=True)
+
+            # 2d: 训练循环 — 先收 Head 的控制消息，再调用 engine.train_batch()
+            while True:
+                # 先等 Head 的控制消息
+                ctrl = torch.zeros(2, dtype=torch.int64, device="cuda")
+                dist.recv(ctrl, src=0)
+                ctrl_flag = int(ctrl[0].item())
+
+                if ctrl_flag == TRAIN_DONE:
+                    break
+
+                if ctrl_flag == TRAIN_MB:
+                    # 收 mb indices，从缓存中切片
+                    mb_size = int(ctrl[1].item())
+                    mb_indices = torch.zeros(mb_size, dtype=torch.int64, device="cuda")
+                    dist.recv(mb_indices, src=0)
+
+                    train_tensors = {k: v[mb_indices] for k, v in train_cache.items()}
+                    train_data = TensorDict(train_tensors, batch_size=[mb_size])
+
+                    # 统一调用 engine.train_batch() 处理 forward/backward/optimizer step
+                    train_result = engine.train_batch(train_data, tail_loss_fn)
+
+                    # 将 loss/metrics 回传给 Head
+                    loss_val = train_result.get("loss", [0.0])[0] if train_result else 0.0
+                    metrics = train_result.get("metrics", {})
+                    metrics_tensor = torch.tensor([
+                        float(loss_val),
+                        float(metrics.get("clipfrac", 0.0)),
+                        float(metrics.get("approx_kl", 0.0)),
+                    ], dtype=torch.float32, device="cuda")
+                    dist.send(metrics_tensor, dst=0)
+
+    # Checkpoint（placeholder）
     print(f"[rank{rank}] v4 3-stage pipeline engine initialized", flush=True)
 
     if engine.is_head:

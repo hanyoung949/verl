@@ -23,7 +23,8 @@ EngineRegistry = _mod.EngineRegistry
 
 from .stage import HeadStage, TailStage
 from .middle_stage import MiddleStage
-from .transport import StageTransport, FWD_ONLY, FWD_WITH_BWD, SHUTDOWN
+from .transport import StageTransport, FWD_ONLY, FWD_WITH_BWD, SHUTDOWN, PIPELINE_DONE
+from verl.utils.torch_functional import logprobs_from_logits
 
 
 @EngineRegistry.register(model_type="llm", backend="split_pipeline", device="cuda")
@@ -93,7 +94,8 @@ class SplitPipelineEngine(BaseEngine):
         if self.is_head:
             head_layers = [l.to("cuda") for l in layers[:self.front_end]]
             self.stage = HeadStage(embed_tokens.to("cuda"), head_layers,
-                                   rotary_emb.to("cuda") if rotary_emb is not None else None, "cuda")
+                                   rotary_emb.to("cuda") if rotary_emb is not None else None, "cuda",
+                                   lr=self.lr, clip_grad=self.clip_grad)
             self.transport = StageTransport(0, 1, "cuda")
             self.tokenizer = AutoTokenizer.from_pretrained(self._resolve_model_path(self.model_path))
             if self.tokenizer.pad_token is None:
@@ -132,11 +134,9 @@ class SplitPipelineEngine(BaseEngine):
         ctx = torch.no_grad() if forward_only else nullcontext()
         with ctx:
             h, pos_ids, pos_emb, mask = self.stage.forward_input(input_ids, attention_mask)
-
-            # 发给 Middle: header(6-int tensor) + h + pos_ids + [mask]
-            flag = FWD_ONLY if forward_only else FWD_WITH_BWD
             B, S, H = h.shape
             has_mask = 0 if mask is None else 1
+            flag = FWD_ONLY if forward_only else FWD_WITH_BWD
             header = torch.tensor([flag, B, S, H, has_mask, 0], dtype=torch.int64, device="cuda")
             self.transport.send(header)
             self.transport.send(h)
@@ -145,24 +145,30 @@ class SplitPipelineEngine(BaseEngine):
                 self.transport.send(mask)
 
             if not forward_only:
-                # 等 Middle 的 grad 回来
+                # FWD_WITH_BWD: Tail 算 loss.backward() → grad 经 Middle 回 Head
+                # Head 收 grad_h 从 Middle
                 grad_h = self.transport.recv(h.shape, h.dtype)
                 h.backward(grad_h)
+                return {}
             else:
-                # 接收 Tail 返回的 logits
-                result_shape = torch.zeros(2, dtype=torch.int64, device="cuda")
+                # FWD_ONLY: 收 Tail 返回的 logits（shape 包含 vocab size，避免硬编码）
+                result_shape = torch.zeros(3, dtype=torch.int64, device="cuda")
                 dist.recv(result_shape, src=2)
-                logits = torch.empty(result_shape[0].item(), result_shape[1].item(), 151936,
+                logits = torch.empty(result_shape[0].item(), result_shape[1].item(), result_shape[2].item(),
                                     dtype=torch.bfloat16, device="cuda")
                 dist.recv(logits, src=2)
-                return {"logits": logits}
+                return {"logits": logits.detach()}
 
         return {}
 
     def _tail_forward_backward(self, data, loss_function, forward_only):
-        # 从 Middle 接收 header
+        # 从 Middle 接收 header + activation + pos_ids
         header = torch.zeros(6, dtype=torch.int64, device="cuda")
         dist.recv(header, src=1)
+        flag = int(header[0].item())
+        if flag == PIPELINE_DONE:
+            # Head 通知 pipeline 结束，直接返回空结果让调用方 break
+            return {}
         _flag, B, S, H, _has_mask, dtype_code = [int(x) for x in header.tolist()]
         tensor_dtype = {0: torch.bfloat16, 1: torch.float16, 2: torch.float32}[dtype_code]
         h_middle = self.transport.recv((B, S, H), tensor_dtype)
@@ -191,7 +197,12 @@ class SplitPipelineEngine(BaseEngine):
                 else:
                     loss = loss_output
 
-            if not forward_only and loss is not None:
+            if forward_only:
+                # FWD_ONLY: 发送 logits 回 Head（直接 P2P，不经过 Middle）
+                dist.send(torch.tensor([logits.shape[0], logits.shape[1], logits.shape[2]],
+                                       dtype=torch.int64, device="cuda"), dst=0)
+                dist.send(logits, dst=0)
+            elif loss is not None:
                 loss.backward()
                 # 把 grad 发给 Middle（Middle 再转发给 Head）
                 self.transport.send(h_in.grad)
@@ -204,18 +215,110 @@ class SplitPipelineEngine(BaseEngine):
     def train_batch(self, data, loss_function):
         if self.is_middle:
             return {}
-        if self.is_tail:
-            self.stage.zero_grad()
+        self.stage.zero_grad()
         outputs = self.forward_backward_batch(data, loss_function, forward_only=False)
-        if self.is_tail:
-            grad_norm = self.stage.step()
-            if "metrics" not in outputs:
-                outputs["metrics"] = {}
-            outputs["metrics"]["grad_norm"] = grad_norm
+        grad_norm = self.stage.step()
+        if "metrics" not in outputs:
+            outputs["metrics"] = {}
+        outputs["metrics"]["grad_norm"] = grad_norm
         return outputs
 
     def infer_batch(self, data, loss_function=None):
         return self.forward_backward_batch(data, loss_function, forward_only=True)
+
+    def sample_next_token(self, data, temperature=1.0, pad_token_id=0):
+        """Tail 本地采样，只回传 next_token + log_prob。
+
+        通信量从 O(B*S*vocab) 降到 O(B)。
+        """
+        if self.is_middle:
+            return {}
+        if self.is_head:
+            return self._head_sample(data, temperature, pad_token_id)
+        if self.is_tail:
+            return self._tail_sample(data, temperature, pad_token_id)
+
+    def _head_sample(self, data, temperature, pad_token_id):
+        input_ids = data["input_ids"]
+        attention_mask = data.get("attention_mask", torch.ones_like(input_ids))
+        finished = data.get("finished", torch.zeros(input_ids.size(0), dtype=torch.bool, device="cuda"))
+
+        with torch.no_grad():
+            h, pos_ids, pos_emb, mask = self.stage.forward_input(input_ids, attention_mask)
+            B, S, H = h.shape
+            has_mask = 0 if mask is None else 1
+            header = torch.tensor([FWD_ONLY, B, S, H, has_mask, 0], dtype=torch.int64, device="cuda")
+            self.transport.send(header)
+            self.transport.send(h)
+            self.transport.send(pos_ids)
+            if mask is not None:
+                self.transport.send(mask)
+
+            # 发送 temperature + finished_mask + pad_token_id（直接 P2P 到 Tail）
+            dist.send(torch.tensor([temperature], dtype=torch.float32, device="cuda"), dst=2)
+            dist.send(finished.to(torch.int64), dst=2)
+            dist.send(torch.tensor([pad_token_id], dtype=torch.int64, device="cuda"), dst=2)
+
+            # 接收 next_token [B, 1] + log_prob [B, 1]
+            next_token = torch.empty(B, 1, dtype=torch.int64, device="cuda")
+            dist.recv(next_token, src=2)
+            log_prob = torch.empty(B, 1, dtype=torch.float32, device="cuda")
+            dist.recv(log_prob, src=2)
+
+            return {"next_token": next_token, "log_prob": log_prob}
+
+    def _tail_sample(self, data, temperature, pad_token_id):
+        header = torch.zeros(6, dtype=torch.int64, device="cuda")
+        dist.recv(header, src=1)
+        flag = int(header[0].item())
+        if flag == PIPELINE_DONE:
+            return {}
+        _flag, B, S, H, _has_mask, dtype_code = [int(x) for x in header.tolist()]
+        tensor_dtype = {0: torch.bfloat16, 1: torch.float16, 2: torch.float32}[dtype_code]
+        h_middle = self.transport.recv((B, S, H), tensor_dtype)
+        pos_ids = self.transport.recv((B, S), torch.int64)
+
+        # 接收 temperature + finished_mask + pad_token_id（直接 P2P 从 Head）
+        temp_tensor = torch.zeros(1, dtype=torch.float32, device="cuda")
+        dist.recv(temp_tensor, src=0)
+        temperature = temp_tensor.item()
+
+        finished_int = torch.zeros(B, dtype=torch.int64, device="cuda")
+        dist.recv(finished_int, src=0)
+        finished = finished_int.to(torch.bool)
+
+        pad_id_tensor = torch.zeros(1, dtype=torch.int64, device="cuda")
+        dist.recv(pad_id_tensor, src=0)
+        pad_token_id = int(pad_id_tensor.item())
+
+        pos_emb = None
+        if self.stage.rotary_emb is not None:
+            try:
+                pos_emb = self.stage.rotary_emb(h_middle.to("cuda"), pos_ids.to("cuda"))
+            except TypeError:
+                pos_emb = self.stage.rotary_emb(h_middle.to("cuda"), seq_len=S)
+
+        with torch.no_grad():
+            logits = self.stage.forward_output(h_middle, position_ids=pos_ids, position_embeddings=pos_emb)
+            last_logits = logits[:, -1, :]  # [B, vocab]
+
+            if temperature > 0:
+                probs = torch.softmax(last_logits / temperature, dim=-1)
+                next_token = torch.multinomial(probs, num_samples=1)
+            else:
+                next_token = torch.argmax(last_logits, dim=-1, keepdim=True)
+
+            # 对 finished 序列，强制设为 pad_token_id
+            next_token = torch.where(finished.unsqueeze(-1), torch.full_like(next_token, pad_token_id), next_token)
+
+            # 计算 log_prob（对 next_token）
+            # 手动实现，避免依赖 flash-attn 在 Tail 端可能的问题
+            log_prob = torch.log_softmax(last_logits, dim=-1)
+            log_prob = torch.gather(log_prob, dim=-1, index=next_token).float()  # 转为 float32 匹配 Head 的 recv
+
+        dist.send(next_token, dst=0)
+        dist.send(log_prob, dst=0)
+        return {"next_token": next_token, "log_prob": log_prob}
 
     def optimizer_zero_grad(self):
         if self.is_tail and self.stage is not None:

@@ -14,6 +14,10 @@ FWD_ONLY = 0
 FWD_WITH_BWD = 1
 SHUTDOWN = 2
 PIPELINE_DONE = 3
+TRAIN_MB = 4      # Head 通知 Tail：开始一个 mini-batch
+TRAIN_DONE = 5    # Head 通知 Tail：训练结束
+STEP_SKIP = 6     # Head 通知 Tail：本 step 跳过训练（dynamic_sampling 全过滤）
+TRAIN_START = 7   # Head 通知 Tail：开始接收训练数据
 
 _DTYPE_CODE = {
     torch.bfloat16: 0,

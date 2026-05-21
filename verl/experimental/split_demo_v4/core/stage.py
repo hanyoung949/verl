@@ -53,12 +53,14 @@ class Stage(nn.Module):
 
 
 class HeadStage(Stage):
-    """Head stage: 包含 embed_tokens + front_layers + rotary_emb。"""
+    """Head stage: 包含 embed_tokens + front_layers + rotary_emb + optimizer。"""
 
-    def __init__(self, embed_tokens, layers, rotary_emb, device):
+    def __init__(self, embed_tokens, layers, rotary_emb, device, lr=1e-4, clip_grad=1.0):
         super().__init__("head", layers, device, trainable=True)
         self.embed_tokens = embed_tokens
         self.rotary_emb = rotary_emb
+        self.optimizer = torch.optim.AdamW(self.trainable_parameters(), lr=lr)
+        self.clip_grad = clip_grad
 
     def forward_input(self, input_ids, attention_mask):
         """从 input_ids 开始前向，返回 (h, position_ids, position_embeddings, causal_mask)。"""
@@ -103,6 +105,15 @@ class HeadStage(Stage):
         for layer in self.layers:
             params.extend(p for p in layer.parameters() if p.requires_grad)
         return params
+
+    def zero_grad(self):
+        self.optimizer.zero_grad()
+
+    def step(self):
+        if self.clip_grad > 0:
+            torch.nn.utils.clip_grad_norm_(self.trainable_parameters(), self.clip_grad)
+        self.optimizer.step()
+        return 0.0
 
 
 class TailStage(Stage):
@@ -151,3 +162,12 @@ class TailStage(Stage):
         for name, p in self.named_parameters():
             if name in state:
                 p.data.copy_(state[name].to(p.device))
+
+    def zero_grad(self):
+        self.optimizer.zero_grad()
+
+    def step(self):
+        if self.clip_grad > 0:
+            torch.nn.utils.clip_grad_norm_(self.trainable_parameters(), self.clip_grad)
+        self.optimizer.step()
+        return 0.0
