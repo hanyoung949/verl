@@ -51,12 +51,20 @@ class MiddleStage:
         """转发循环: 从 Head 接收 header+data，原样转发给 Tail。"""
         head_rank = 0
         tail_rank = 2
+        _VALID_FLAGS = {FWD_ONLY, FWD_WITH_BWD, SHUTDOWN, PIPELINE_DONE}
 
         while True:
             # 从 Head 接收 header（6-int tensor）
             header = torch.zeros(6, dtype=torch.int64, device=self.device)
             dist.recv(header, src=head_rank)
             flag = int(header[0].item())
+
+            if flag not in _VALID_FLAGS:
+                raise RuntimeError(
+                    f"[MiddleStage] received illegal flag {flag} from rank {head_rank}. "
+                    f"Valid flags: {_VALID_FLAGS}. "
+                    f"This usually means a Head→Tail direct message leaked into the Middle pipeline."
+                )
 
             if flag == SHUTDOWN:
                 break

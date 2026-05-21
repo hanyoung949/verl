@@ -1,43 +1,40 @@
-"""rollout 抽象基类。"""
+"""Rollout backend 抽象基类。
+
+任何 rollout 实现（pipeline、DP、TP、张量并行等）都必须继承 BaseRolloutBackend，
+从而保证 SplitTrainer 可以以统一方式调用。
+"""
 
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
-from typing import Any, Optional
-
-from torch import Tensor
 
 
-@dataclass
-class RolloutOutput:
-    """rollout 输出结构。
+class BaseRolloutBackend(ABC):
+    """Rollout 后端抽象基类。
 
-    使用 dataclass 的原因：
-    - 字段访问更安全，不依赖字符串 key；
-    - 后续扩展 speculative / cache 信息时，加 Optional 字段即可；
-    - trainer 对新增字段天然向后兼容。
+    职责：
+      - Head 端：把 prompt 扩展成 response（generate）。
+      - Tail 端：进入服务循环，接收并处理 Head 的采样请求（run_tail_loop）。
     """
 
-    sequences: Tensor
-    attention_mask: Tensor
-    response_ids: Tensor
-    response_mask: Tensor
-    prompt_len: int
-    draft_acceptance_rate: Optional[float] = None
-    kv_cache: Optional[Any] = None
+    @abstractmethod
+    def generate(self, prompt_ids, group_size, max_new_tokens, attention_mask=None):
+        """Head 端调用：执行完整 rollout，返回结果对象。
 
-
-class SplitRolloutBackend(ABC):
-    """rollout 抽象接口。"""
+        返回对象必须至少包含以下属性：
+          - sequences:       [B*G, prompt_len + response_len]
+          - attention_mask:  [B*G, prompt_len + response_len]
+          - response_ids:    [B*G, response_len]
+          - response_mask:   [B*G, response_len]
+          - old_log_probs:   [B*G, response_len]
+          - prompt_len:      int
+        """
+        pass
 
     @abstractmethod
-    def generate(
-        self,
-        prompt_ids: Tensor,
-        group_size: int,
-        max_new_tokens: int,
-        attention_mask: Optional[Tensor] = None,
-    ) -> RolloutOutput:
-        """根据 prompt 生成完整 response。"""
+    def run_tail_loop(self):
+        """Tail 端调用：阻塞式服务循环，直到 rollout 阶段结束。
 
+        当 Head 端 generate() 完成后，Tail 端应收到结束信号并退出循环。
+        """
+        pass

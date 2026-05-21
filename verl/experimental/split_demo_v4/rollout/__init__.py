@@ -1,7 +1,4 @@
-"""rollout 策略层。"""
+from .base import BaseRolloutBackend
+from .simple_pipeline_rollout import SimplePipelineRollout
 
-from .base import RolloutOutput, SplitRolloutBackend
-from .naive import NaiveSplitRollout
-
-__all__ = ["SplitRolloutBackend", "RolloutOutput", "NaiveSplitRollout"]
-
+__all__ = ["BaseRolloutBackend", "SimplePipelineRollout"]
