@@ -104,13 +104,13 @@ class SplitTrainer:
         for name in ["response_ids", "response_mask"]:
             tensor = getattr(rollout_output, name)
             shape_t = torch.tensor(list(tensor.shape), dtype=torch.int64, device="cuda")
-            dist.send(shape_t, dst=2)
-            dist.send(tensor.contiguous(), dst=2)
-        dist.send(torch.tensor([rollout_output.prompt_len], dtype=torch.int64, device="cuda"), dst=2)
+            dist.send(shape_t, dst=self.engine.tail_rank)
+            dist.send(tensor.contiguous(), dst=self.engine.tail_rank)
+        dist.send(torch.tensor([rollout_output.prompt_len], dtype=torch.int64, device="cuda"), dst=self.engine.tail_rank)
 
         # 2b: 等 Tail 确认已收到 rollout results
         tail_ready = torch.zeros(1, dtype=torch.int64, device="cuda")
-        dist.recv(tail_ready, src=2)
+        dist.recv(tail_ready, src=self.engine.tail_rank)
 
         # 2c: old_log_prob（rollout 时已保存，无需 infer_batch 重算）
         old_log_prob = rollout_output.old_log_probs
@@ -138,7 +138,7 @@ class SplitTrainer:
         if int(valid_groups.sum().item()) == 0:
             print(f"[step {global_step}] all groups filtered, skip", flush=True)
             skip_ctrl = torch.tensor([STEP_SKIP, 0], dtype=torch.int64, device="cuda")
-            dist.send(skip_ctrl, dst=2)
+            dist.send(skip_ctrl, dst=self.engine.tail_rank)
             return
         valid_seq = valid_groups.unsqueeze(1).expand(batch_size, group_size).reshape(-1)
         uid_array = [f"g{pi}" for pi in range(batch_size) for _ in range(group_size)]
@@ -160,7 +160,7 @@ class SplitTrainer:
         n_valid = seq_v.size(0)
 
         # 通知 Tail 开始接收训练数据
-        dist.send(torch.tensor([TRAIN_START, 0], dtype=torch.int64, device="cuda"), dst=2)
+        dist.send(torch.tensor([TRAIN_START, 0], dtype=torch.int64, device="cuda"), dst=self.engine.tail_rank)
 
         # 一次性发送完整训练数据给 Tail
         tensors_to_send = [resp_ids_v, resp_mask_v, old_lp_v, advantages_valid]
@@ -169,16 +169,16 @@ class SplitTrainer:
             shape_t = torch.tensor(list(tensor.shape), dtype=torch.int64, device="cuda")
             dtype_map = {torch.float32: 0, torch.bfloat16: 1, torch.float16: 2, torch.int64: 3}
             dtype_t = torch.tensor([dtype_map.get(tensor.dtype, 0)], dtype=torch.int64, device="cuda")
-            dist.send(shape_t, dst=2)
-            dist.send(dtype_t, dst=2)
-            dist.send(tensor.contiguous(), dst=2)
+            dist.send(shape_t, dst=self.engine.tail_rank)
+            dist.send(dtype_t, dst=self.engine.tail_rank)
+            dist.send(tensor.contiguous(), dst=self.engine.tail_rank)
         # 发 GRPO 配置
         grpo_cfg = torch.tensor([
             float(self.config.algorithm.cliprange_low),
             float(self.config.algorithm.cliprange_high),
             float(self.config.algorithm.loss_scale_factor),
         ], dtype=torch.float32, device="cuda")
-        dist.send(grpo_cfg, dst=2)
+        dist.send(grpo_cfg, dst=self.engine.tail_rank)
         print(f"[step {global_step}] full data + GRPO config sent", flush=True)
 
         last_loss = last_clipfrac = last_approx_kl = 0.0
@@ -195,8 +195,8 @@ class SplitTrainer:
 
                 # Head 给 Tail 发 TRAIN_MB + mb indices
                 ctrl_header = torch.tensor([TRAIN_MB, mb.size(0)], dtype=torch.int64, device="cuda")
-                dist.send(ctrl_header, dst=2)
-                dist.send(mb, dst=2)
+                dist.send(ctrl_header, dst=self.engine.tail_rank)
+                dist.send(mb, dst=self.engine.tail_rank)
 
                 # Head 调用 train_batch
                 mb_data = {
@@ -212,14 +212,14 @@ class SplitTrainer:
 
                 # 从 Tail 接收 loss/metrics
                 metrics_tensor = torch.zeros(3, dtype=torch.float32, device="cuda")
-                dist.recv(metrics_tensor, src=2)
+                dist.recv(metrics_tensor, src=self.engine.tail_rank)
                 last_loss = metrics_tensor[0].item()
                 last_clipfrac = metrics_tensor[1].item()
                 last_approx_kl = metrics_tensor[2].item()
 
         # 训练结束
         done_ctrl = torch.tensor([TRAIN_DONE, 0], dtype=torch.int64, device="cuda")
-        dist.send(done_ctrl, dst=2)
+        dist.send(done_ctrl, dst=self.engine.tail_rank)
 
         print(f"[step {global_step}] loss={last_loss:.4f} "
               f"approx_kl={last_approx_kl:.4f} "
@@ -234,14 +234,14 @@ class SplitTrainer:
         # 2a: Receive rollout results from Head
         for _ in range(2):
             shape_t = torch.zeros(2, dtype=torch.int64, device="cuda")
-            dist.recv(shape_t, src=0)
+            dist.recv(shape_t, src=self.engine.head_rank)
             buf = torch.zeros(*[int(s) for s in shape_t.tolist()], dtype=torch.int64, device="cuda")
-            dist.recv(buf, src=0)
+            dist.recv(buf, src=self.engine.head_rank)
         pl = torch.zeros(1, dtype=torch.int64, device="cuda")
-        dist.recv(pl, src=0)
+        dist.recv(pl, src=self.engine.head_rank)
 
         # 2b: 先发 ready 给 Head
-        dist.send(torch.tensor([1], dtype=torch.int64, device="cuda"), dst=0)
+        dist.send(torch.tensor([1], dtype=torch.int64, device="cuda"), dst=self.engine.head_rank)
 
         # old_log_prob forward loop —— 统一走 engine API
         while True:
@@ -251,7 +251,7 @@ class SplitTrainer:
 
         # 2c: 接收 Head 的控制消息
         ctrl = torch.zeros(2, dtype=torch.int64, device="cuda")
-        dist.recv(ctrl, src=0)
+        dist.recv(ctrl, src=self.engine.head_rank)
         ctrl_flag = int(ctrl[0].item())
         if ctrl_flag == STEP_SKIP:
             return
@@ -265,18 +265,18 @@ class SplitTrainer:
         train_cache = {}
         for name in ["response_ids", "response_mask", "old_log_probs", "advantages"]:
             shape_t = torch.zeros(2, dtype=torch.int64, device="cuda")
-            dist.recv(shape_t, src=0)
+            dist.recv(shape_t, src=self.engine.head_rank)
             dtype_t = torch.zeros(1, dtype=torch.int64, device="cuda")
-            dist.recv(dtype_t, src=0)
+            dist.recv(dtype_t, src=self.engine.head_rank)
             dtype_map = {0: torch.float32, 1: torch.bfloat16, 2: torch.float16, 3: torch.int64}
             buf = torch.empty(*[int(s) for s in shape_t.tolist()],
                             dtype=dtype_map[int(dtype_t.item())], device="cuda")
-            dist.recv(buf, src=0)
+            dist.recv(buf, src=self.engine.head_rank)
             train_cache[name] = buf
 
         # 接收 GRPO 配置
         grpo_cfg = torch.zeros(3, dtype=torch.float32, device="cuda")
-        dist.recv(grpo_cfg, src=0)
+        dist.recv(grpo_cfg, src=self.engine.head_rank)
         tail_loss_fn = make_grpo_loss_fn(
             clip_low=float(grpo_cfg[0].item()), clip_high=float(grpo_cfg[1].item()),
             loss_agg_mode=str(self.config.algorithm.loss_agg_mode), loss_scale_factor=int(grpo_cfg[2].item()))
@@ -285,7 +285,7 @@ class SplitTrainer:
         # 2d: 训练循环
         while True:
             ctrl = torch.zeros(2, dtype=torch.int64, device="cuda")
-            dist.recv(ctrl, src=0)
+            dist.recv(ctrl, src=self.engine.head_rank)
             ctrl_flag = int(ctrl[0].item())
 
             if ctrl_flag == TRAIN_DONE:
@@ -294,7 +294,7 @@ class SplitTrainer:
             if ctrl_flag == TRAIN_MB:
                 mb_size = int(ctrl[1].item())
                 mb_indices = torch.zeros(mb_size, dtype=torch.int64, device="cuda")
-                dist.recv(mb_indices, src=0)
+                dist.recv(mb_indices, src=self.engine.head_rank)
 
                 train_tensors = {k: v[mb_indices] for k, v in train_cache.items()}
                 train_data = TensorDict(train_tensors, batch_size=[mb_size])
@@ -308,7 +308,7 @@ class SplitTrainer:
                     float(metrics.get("clipfrac", 0.0)),
                     float(metrics.get("approx_kl", 0.0)),
                 ], dtype=torch.float32, device="cuda")
-                dist.send(metrics_tensor, dst=0)
+                dist.send(metrics_tensor, dst=self.engine.head_rank)
 
     # ------------------------------------------------------------------
     # 通用辅助方法

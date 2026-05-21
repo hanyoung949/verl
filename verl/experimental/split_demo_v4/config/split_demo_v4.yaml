@@ -8,6 +8,10 @@ data:
 split:
   front_end: 4
   middle_end: 32
+  topology:
+    head: [0]
+    middle: [1]
+    tail: [2]
 
 lora:
   r: 16

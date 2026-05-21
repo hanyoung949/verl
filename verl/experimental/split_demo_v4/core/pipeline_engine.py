@@ -36,7 +36,7 @@ class SplitPipelineEngine(BaseEngine):
     rank2: TailStage (tail + norm + lm_head + LoRA + optimizer)
     """
 
-    def __init__(self, model_config=None, engine_config=None, optimizer_config=None, checkpoint_config=None):
+    def __init__(self, model_config=None, engine_config=None, optimizer_config=None, checkpoint_config=None, topology=None):
         super().__init__()
         self.model_config = model_config
         self.engine_config = engine_config
@@ -44,10 +44,31 @@ class SplitPipelineEngine(BaseEngine):
         self.checkpoint_config = checkpoint_config
         self.rank = dist.get_rank() if dist.is_initialized() else 0
         self.stage = None
-        self.is_head = self.rank == 0
-        self.is_middle = self.rank == 1
-        self.is_tail = self.rank == 2
+        self.topology = topology or {"head": [0], "middle": [1], "tail": [2]}
+        self._resolve_stage()
         self._parse_config()
+
+    def _resolve_stage(self):
+        t = self.topology
+        self.is_head = self.rank in t.get("head", [0])
+        self.is_middle = self.rank in t.get("middle", [1])
+        self.is_tail = self.rank in t.get("tail", [2])
+
+    @property
+    def head_rank(self):
+        return self.topology["head"][0]
+
+    @property
+    def tail_rank(self):
+        return self.topology["tail"][0]
+
+    @property
+    def middle_first_rank(self):
+        return self.topology["middle"][0]
+
+    @property
+    def middle_last_rank(self):
+        return self.topology["middle"][-1]
 
     def _parse_config(self):
         if self.model_config is not None:
@@ -96,7 +117,7 @@ class SplitPipelineEngine(BaseEngine):
             self.stage = HeadStage(embed_tokens.to("cuda"), head_layers,
                                    rotary_emb.to("cuda") if rotary_emb is not None else None, "cuda",
                                    lr=self.lr, clip_grad=self.clip_grad)
-            self.transport = StageTransport(0, 1, "cuda")
+            self.transport = StageTransport(self.rank, self.middle_first_rank, "cuda")
             self.tokenizer = AutoTokenizer.from_pretrained(self._resolve_model_path(self.model_path))
             if self.tokenizer.pad_token is None:
                 self.tokenizer.pad_token = self.tokenizer.eos_token
@@ -113,7 +134,7 @@ class SplitPipelineEngine(BaseEngine):
             self.stage = TailStage(tail_layers, norm.to("cuda"), lm_head.to("cuda"), "cuda",
                                   lr=self.lr, clip_grad=self.clip_grad,
                                   rotary_emb=rotary_emb.to("cuda") if rotary_emb is not None else None)
-            self.transport = StageTransport(2, 1, "cuda")
+            self.transport = StageTransport(self.rank, self.middle_last_rank, "cuda")
             self.tokenizer = AutoTokenizer.from_pretrained(self._resolve_model_path(self.model_path))
             if self.tokenizer.pad_token is None:
                 self.tokenizer.pad_token = self.tokenizer.eos_token
@@ -153,10 +174,11 @@ class SplitPipelineEngine(BaseEngine):
             else:
                 # FWD_ONLY: 收 Tail 返回的 logits（shape 包含 vocab size，避免硬编码）
                 result_shape = torch.zeros(3, dtype=torch.int64, device="cuda")
-                dist.recv(result_shape, src=2)
+                tail_rank = self.tail_rank
+                dist.recv(result_shape, src=tail_rank)
                 logits = torch.empty(result_shape[0].item(), result_shape[1].item(), result_shape[2].item(),
                                     dtype=torch.bfloat16, device="cuda")
-                dist.recv(logits, src=2)
+                dist.recv(logits, src=tail_rank)
                 return {"logits": logits.detach()}
 
         return {}
@@ -199,9 +221,10 @@ class SplitPipelineEngine(BaseEngine):
 
             if forward_only:
                 # FWD_ONLY: 发送 logits 回 Head（直接 P2P，不经过 Middle）
+                head_rank = self.head_rank
                 dist.send(torch.tensor([logits.shape[0], logits.shape[1], logits.shape[2]],
-                                       dtype=torch.int64, device="cuda"), dst=0)
-                dist.send(logits, dst=0)
+                                       dtype=torch.int64, device="cuda"), dst=head_rank)
+                dist.send(logits, dst=head_rank)
             elif loss is not None:
                 loss.backward()
                 # 把 grad 发给 Middle（Middle 再转发给 Head）
@@ -255,15 +278,16 @@ class SplitPipelineEngine(BaseEngine):
                 self.transport.send(mask)
 
             # 发送 temperature + finished_mask + pad_token_id（直接 P2P 到 Tail）
-            dist.send(torch.tensor([temperature], dtype=torch.float32, device="cuda"), dst=2)
-            dist.send(finished.to(torch.int64), dst=2)
-            dist.send(torch.tensor([pad_token_id], dtype=torch.int64, device="cuda"), dst=2)
+            tail_rank = self.tail_rank
+            dist.send(torch.tensor([temperature], dtype=torch.float32, device="cuda"), dst=tail_rank)
+            dist.send(finished.to(torch.int64), dst=tail_rank)
+            dist.send(torch.tensor([pad_token_id], dtype=torch.int64, device="cuda"), dst=tail_rank)
 
             # 接收 next_token [B, 1] + log_prob [B, 1]
             next_token = torch.empty(B, 1, dtype=torch.int64, device="cuda")
-            dist.recv(next_token, src=2)
+            dist.recv(next_token, src=tail_rank)
             log_prob = torch.empty(B, 1, dtype=torch.float32, device="cuda")
-            dist.recv(log_prob, src=2)
+            dist.recv(log_prob, src=tail_rank)
 
             return {"next_token": next_token, "log_prob": log_prob}
 
@@ -280,15 +304,16 @@ class SplitPipelineEngine(BaseEngine):
 
         # 接收 temperature + finished_mask + pad_token_id（直接 P2P 从 Head）
         temp_tensor = torch.zeros(1, dtype=torch.float32, device="cuda")
-        dist.recv(temp_tensor, src=0)
+        head_rank = self.head_rank
+        dist.recv(temp_tensor, src=head_rank)
         temperature = temp_tensor.item()
 
         finished_int = torch.zeros(B, dtype=torch.int64, device="cuda")
-        dist.recv(finished_int, src=0)
+        dist.recv(finished_int, src=head_rank)
         finished = finished_int.to(torch.bool)
 
         pad_id_tensor = torch.zeros(1, dtype=torch.int64, device="cuda")
-        dist.recv(pad_id_tensor, src=0)
+        dist.recv(pad_id_tensor, src=head_rank)
         pad_token_id = int(pad_id_tensor.item())
 
         pos_emb = None
@@ -316,8 +341,8 @@ class SplitPipelineEngine(BaseEngine):
             log_prob = torch.log_softmax(last_logits, dim=-1)
             log_prob = torch.gather(log_prob, dim=-1, index=next_token).float()  # 转为 float32 匹配 Head 的 recv
 
-        dist.send(next_token, dst=0)
-        dist.send(log_prob, dst=0)
+        dist.send(next_token, dst=head_rank)
+        dist.send(log_prob, dst=head_rank)
         return {"next_token": next_token, "log_prob": log_prob}
 
     def optimizer_zero_grad(self):

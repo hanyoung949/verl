@@ -47,10 +47,11 @@ class MiddleStage:
     def _send_tensor(self, tensor, dst):
         dist.send(tensor.contiguous(), dst=dst)
 
-    def run(self):
+    def run(self, topology=None):
         """转发循环: 从 Head 接收 header+data，原样转发给 Tail。"""
-        head_rank = 0
-        tail_rank = 2
+        t = topology or {"head": [0], "middle": [1], "tail": [2]}
+        head_rank = t["head"][0]
+        tail_rank = t["tail"][0]
         _VALID_FLAGS = {FWD_ONLY, FWD_WITH_BWD, SHUTDOWN, PIPELINE_DONE}
 
         while True:

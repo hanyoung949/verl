@@ -50,7 +50,12 @@ def main(config: DictConfig):
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
     torch.cuda.set_device(local_rank)
 
-    engine = SplitPipelineEngine()
+    topology = {
+        "head": list(config.split.topology.head),
+        "middle": list(config.split.topology.middle),
+        "tail": list(config.split.topology.tail),
+    }
+    engine = SplitPipelineEngine(topology=topology)
     engine.model_path = str(config.model.path)
     engine.front_end = int(config.split.front_end)
     engine.middle_end = int(config.split.middle_end)
@@ -58,10 +63,10 @@ def main(config: DictConfig):
     engine.clip_grad = float(config.trainer.max_grad_norm)
     engine.initialize()
 
-    # rank1 (Middle): 进入请求响应循环
-    if rank == 1:
+    # Middle: 进入请求响应循环
+    if engine.is_middle:
         try:
-            engine.stage.run()
+            engine.stage.run(topology=topology)
         finally:
             dist.destroy_process_group()
         return
