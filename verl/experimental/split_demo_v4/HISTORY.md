@@ -87,6 +87,28 @@
 
 ---
 
+## Phase B：Trainer / Rollout 抽象
+
+### B1. 抽取 SplitTrainer
+
+- 新增 `trainer/split_trainer.py`：`SplitTrainer` 类，包含 `fit()` + Head/Tail step 逻辑
+- `main_split_v4.py` 从 500+ 行精简到 ~80 行，只负责组件组装
+- 修复抽取时的 `grpo_loss_fn` shape 误抄（`ratio * adv.unsqueeze(-1)` → `adv * ratio`）
+
+### B2. BaseRolloutBackend 抽象
+
+- 新增 `rollout/base.py`：`BaseRolloutBackend` ABC，定义 `generate()` + `run_tail_loop()`
+- 新增 `rollout/simple_pipeline_rollout.py`：`SimplePipelineRollout` 从 `main_split_v4.py` 移入
+- `SplitTrainer` 不再内部处理 `_send_pipeline_done()` / `_rollout_loop()`，统一调用 backend 接口
+- `generate()` 返回前自动发送 `PIPELINE_DONE`，Tail 端 `run_tail_loop()` 消费后退出
+
+### B3. MiddleStage flag 校验
+
+- `core/middle_stage.py` `run()` 中增加 `_VALID_FLAGS = {FWD_ONLY, FWD_WITH_BWD, SHUTDOWN, PIPELINE_DONE}`
+- 非法 flag 时 `raise RuntimeError`，避免协议错位导致的 hang
+
+---
+
 ## 验证记录
 
 - GPU 5,6,7 运行 10 steps 通过，无 NCCL timeout

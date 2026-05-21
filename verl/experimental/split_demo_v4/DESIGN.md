@@ -54,7 +54,7 @@ Tail 是"主 stage"：持有 optimizer、计算 loss、保存 checkpoint、本�
 ### 3.1 模块分层
 
 ```
-main_split_v4.py (入口 + GRPO 训练循环)
+main_split_v4.py (入口，只负责组件组装)
     │
     ├── SplitPipelineEngine(BaseEngine)
     │       ├── initialize()             # 按 rank 创建对应 stage
@@ -64,7 +64,9 @@ main_split_v4.py (入口 + GRPO 训练循环)
     │       ├── sample_next_token()      # A2: Tail 本地采样，回传 token+log_prob
     │       └── save/load_checkpoint()   # Tail 保存 adapter + optimizer
     │
-    ├── SimplePipelineRollout            # 自回归生成（调用 engine.sample_next_token）
+    ├── BaseRolloutBackend (ABC)         # rollout 抽象接口
+    │       └── SimplePipelineRollout    # 3-stage pipeline 实现
+    ├── SplitTrainer                     # GRPO 训练循环（B1 抽取）
     ├── FunctionReward                   # 函数打分（math_exact_match）
     └── make_grpo_loss_fn()              # GRPO loss（clip / loss_agg_mode）
 ```
@@ -182,7 +184,7 @@ for step in range(total_steps):
 
 1. **Head 不持有 optimizer**：当前只有 Tail 保存 checkpoint，Head 的 LoRA 状态在 checkpoint 中缺失（C3 修复）。
 2. **rank 硬编码**：`rank==0=Head`, `rank==1=Middle`, `rank==2=Tail`（C1 修复）。
-3. **Middle 无非法 flag 校验**：收到未知 flag 时静默转发，可能 hang（B3 修复）。
+3. **Middle 无非法 flag 校验**：收到未知 flag 时静默转发，可能 hang（✅ B3 已修复）。
 4. **NCCL P2P 无超时**：当前依赖默认 60s timeout，未配置化（B 阶段考虑）。
 
 ---

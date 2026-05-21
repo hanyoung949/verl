@@ -8,7 +8,7 @@
 
 **目标**：把训练循环和通信协议解耦，抽出可替换的边界。
 
-### B1. 抽取 SplitTrainer（2 天）
+### B1. 抽取 SplitTrainer ✅
 
 **现状**：`main_split_v4.py` 500+ 行，既管协议又管算法。
 
@@ -22,7 +22,7 @@ class SplitTrainer:
 
 **收益**：后续换 backend（vLLM/FSDP）时，main 文件不动，只换组件。
 
-### B2. 引入 BaseRolloutBackend 接口（2 天）
+### B2. 引入 BaseRolloutBackend 接口 ✅
 
 **现状**：直接实例化 `SimplePipelineRollout`，无抽象层。
 
@@ -31,17 +31,18 @@ class SplitTrainer:
 ```python
 class BaseRolloutBackend(ABC):
     @abstractmethod
-    def generate(self, prompt_ids, attention_mask, group_size, max_new_tokens) -> RolloutOutput: ...
-    def sync_weights(self, state_dict): pass  # vLLM 需要，HF 后端空实现
+    def generate(self, prompt_ids, attention_mask, group_size, max_new_tokens): ...
+    @abstractmethod
+    def run_tail_loop(self): ...
 ```
 
-当前实现为 `HFSplitRolloutBackend`。后续 vLLM 接入时实现 `VLLMSplitRolloutBackend`。
+当前实现为 `SimplePipelineRollout`。后续 vLLM 接入时实现 `VLLMSplitRolloutBackend`。
 
 **配置预留**：`rollout.backend: hf | vllm`
 
 **收益**：Rollout 后端可插拔。
 
-### B3. 控制消息状态机校验（半天）
+### B3. 控制消息状态机校验 ✅
 
 **现状**：Tail 侧已加 `TRAIN_START` assert，Middle 转发层无 flag 校验。
 
@@ -98,7 +99,7 @@ split:
 
 | # | 能力 | 预留接口 | 当前占位 |
 |---|------|----------|----------|
-| D1 | vLLM Rollout | `BaseRolloutBackend` + `rollout.backend=vllm` | B2 已留接口 |
+| D1 | vLLM Rollout | `BaseRolloutBackend` + `rollout.backend=vllm` | ✅ B2 已留接口 |
 | D2 | FSDP2 训练 | `BaseEngine` + `engine.backend=fsdp` | C2 已对齐接口 |
 | D3 | 多机 Middle PP | `topology` 支持多 rank | C1 已留配置格式 |
 | D4 | 1F1B Schedule | `engine.train_batch()` 内部注入 microbatch | 接口已预留 |
