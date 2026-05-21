@@ -16,6 +16,7 @@ lora:
   target_modules: ["q_proj", "v_proj"]
 
 rollout:
+  backend: hf
   group_size: 4
   max_new_tokens: 128
   temperature: 1.0

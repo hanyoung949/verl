@@ -255,6 +255,11 @@ class SplitTrainer:
         ctrl_flag = int(ctrl[0].item())
         if ctrl_flag == STEP_SKIP:
             return
+        if ctrl_flag != TRAIN_START:
+            raise RuntimeError(
+                f"[Tail] expected TRAIN_START ({TRAIN_START}) or STEP_SKIP ({STEP_SKIP}), "
+                f"got {ctrl_flag}. Protocol misalignment between Head and Tail."
+            )
 
         # 一次性接收完整训练数据
         train_cache = {}
