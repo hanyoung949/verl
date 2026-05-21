@@ -315,6 +315,8 @@ class SplitTrainer:
     # ------------------------------------------------------------------
 
     def _shutdown(self):
+        peak = torch.cuda.max_memory_allocated() / 1024**3
+        print(f"[rank{dist.get_rank() if dist.is_initialized() else 0}] peak GPU mem: {peak:.2f} GB", flush=True)
         print(f"[rank{dist.get_rank() if dist.is_initialized() else 0}] v4 3-stage pipeline engine initialized", flush=True)
         if self.engine.is_head:
             header = torch.tensor([SHUTDOWN, 0, 0, 0, 0, 0], dtype=torch.int64, device="cuda")

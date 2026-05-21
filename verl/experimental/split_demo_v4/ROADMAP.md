@@ -73,9 +73,9 @@ split:
       ranks: [2]
 ```
 
-用 `topology` 替代 `stage_map`，支持同 stage 多 rank、跨机、DP/PP 混合。
+用 `topology` 替代 `stage_map`，配置格式预留多 rank / DP / PP 扩展空间，当前运行实现仍为单 rank per stage。
 
-**收益**：为后续多机多卡扩展预留概念空间。
+**收益**：为后续多机多卡扩展预留概念空间，同时保证当前代码不因 topology 配置变化而挂。
 
 ### C2. SplitPipelineEngine 对齐 verl BaseEngine（1 天）
 

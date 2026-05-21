@@ -186,7 +186,7 @@ class SplitPipelineEngine(BaseEngine):
     def _tail_forward_backward(self, data, loss_function, forward_only):
         # 从 Middle 接收 header + activation + pos_ids
         header = torch.zeros(6, dtype=torch.int64, device="cuda")
-        dist.recv(header, src=1)
+        dist.recv(header, src=self.middle_last_rank)
         flag = int(header[0].item())
         if flag == PIPELINE_DONE:
             # Head 通知 pipeline 结束，直接返回空结果让调用方 break
@@ -293,7 +293,7 @@ class SplitPipelineEngine(BaseEngine):
 
     def _tail_sample(self, data, temperature, pad_token_id):
         header = torch.zeros(6, dtype=torch.int64, device="cuda")
-        dist.recv(header, src=1)
+        dist.recv(header, src=self.middle_last_rank)
         flag = int(header[0].item())
         if flag == PIPELINE_DONE:
             return {}
@@ -346,11 +346,11 @@ class SplitPipelineEngine(BaseEngine):
         return {"next_token": next_token, "log_prob": log_prob}
 
     def optimizer_zero_grad(self):
-        if self.is_tail and self.stage is not None:
+        if (self.is_head or self.is_tail) and self.stage is not None:
             self.stage.zero_grad()
 
     def optimizer_step(self):
-        if self.is_tail and self.stage is not None:
+        if (self.is_head or self.is_tail) and self.stage is not None:
             return self.stage.step()
         return 0.0
 

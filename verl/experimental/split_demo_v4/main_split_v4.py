@@ -68,6 +68,8 @@ def main(config: DictConfig):
         try:
             engine.stage.run(topology=topology)
         finally:
+            peak = torch.cuda.max_memory_allocated() / 1024**3
+            print(f"[rank{dist.get_rank()}] peak GPU mem: {peak:.2f} GB", flush=True)
             dist.destroy_process_group()
         return
 

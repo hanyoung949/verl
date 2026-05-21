@@ -48,7 +48,11 @@ class MiddleStage:
         dist.send(tensor.contiguous(), dst=dst)
 
     def run(self, topology=None):
-        """转发循环: 从 Head 接收 header+data，原样转发给 Tail。"""
+        """转发循环: 从 Head 接收 header+data，原样转发给 Tail。
+
+        注意：当前运行实现仅支持单 Head / 单 Middle / 单 Tail。
+        topology 格式预留了多 rank 扩展，但多 middle rank 的 PP 调度尚未实现。
+        """
         t = topology or {"head": [0], "middle": [1], "tail": [2]}
         head_rank = t["head"][0]
         tail_rank = t["tail"][0]

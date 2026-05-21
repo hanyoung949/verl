@@ -182,11 +182,10 @@ for step in range(total_steps):
 
 ## 7. 已知问题与限制
 
-1. **Head checkpoint 不完整**：当前 `save_checkpoint()` 只存 Tail 的 adapter + optimizer，Head 的 LoRA 状态和 optimizer state 在 checkpoint 中缺失（C3 修复）。
-2. **rank 硬编码**：`rank==0=Head`, `rank==1=Middle`, `rank==2=Tail`（C1 修复）。
-3. **Middle 无非法 flag 校验**：收到未知 flag 时静默转发，可能 hang（✅ B3 已修复）。
-4. **Tail 采样未实现 top-p**：`_tail_sample()` 只做 temperature softmax + multinomial，`top_p` 配置被忽略。当前默认 `top_p=1.0` 不影响正确性；若需支持，需在 Head→Tail 通信中增加 top_p 参数传递。
-5. **NCCL P2P 无超时**：当前依赖默认 60s timeout，未配置化（B 阶段考虑）。
+1. **Tail 采样未实现 top-p**：`_tail_sample()` 只做 temperature softmax + multinomial，`top_p` 配置被忽略。当前默认 `top_p=1.0` 不影响正确性；若需支持，需在 Head→Tail 通信中增加 top_p 参数传递。
+2. **NCCL P2P 无超时**：当前依赖默认 60s timeout，未配置化（B 阶段考虑）。
+
+> ✅ 已修复：Head checkpoint 完整性（C3）、rank 硬编码（C1）、Middle flag 校验（B3）。
 
 ---
 
