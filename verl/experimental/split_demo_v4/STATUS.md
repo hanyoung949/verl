@@ -98,6 +98,8 @@ clip: low=0.2, high=0.28
 | gpu_peak (Head/rank0) | 1.76 GB | embed + front 4 层 + LoRA |
 | gpu_peak (Tail/rank2) | 2.98 GB | tail 4 层 + norm + lm_head + LoRA + optimizer |
 | gpu_peak (Middle/rank1) | 7.22 GB | middle 28 层（冻结，无梯度/optimizer） |
+| overlong penalty | 支持 | `algorithm.overlong_penalty.{enable, buffer_len, penalty_factor}` |
+| response length shaping | 不支持 | 需接入 verl 主仓库能力 |
 
 ### Checkpoint
 

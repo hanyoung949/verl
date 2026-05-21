@@ -31,9 +31,12 @@ def math_exact_match(text: str, meta: dict) -> float:
 class FunctionReward(RewardAdapter):
     """基于 Python 函数的 reward adapter。"""
 
-    def __init__(self, fn: Callable[[str, dict], float], tokenizer) -> None:
+    def __init__(self, fn: Callable[[str, dict], float], tokenizer,
+                 overlong_cfg=None, max_resp_len=None) -> None:
         self.fn = fn
         self.tokenizer = tokenizer
+        self.overlong_cfg = overlong_cfg
+        self.max_resp_len = max_resp_len
 
     def score(
         self,
@@ -44,6 +47,7 @@ class FunctionReward(RewardAdapter):
         """只 decode response 部分，然后逐条调用规则函数。
 
         这里故意不 decode 整个 sequence，避免 prompt 内容污染 reward。
+        若启用 overlong penalty，response 长度超过阈值时会额外扣分。
         """
 
         prompt_len = int(metadata["prompt_len"])
@@ -55,5 +59,22 @@ class FunctionReward(RewardAdapter):
         for text, answer in zip(texts, answers, strict=True):
             scores.append(self.fn(text, {"answer": answer}))
 
-        return torch.tensor(scores, dtype=torch.float32, device=sequences.device)
+        rewards = torch.tensor(scores, dtype=torch.float32, device=sequences.device)
+
+        # DAPO overlong penalty
+        if self.overlong_cfg and self.overlong_cfg.get("enable", False):
+            buffer_len = self.overlong_cfg["buffer_len"]
+            penalty_factor = self.overlong_cfg["penalty_factor"]
+            expected_len = self.max_resp_len - buffer_len
+
+            resp_mask = attention_mask[:, prompt_len:]
+            valid_lengths = resp_mask.sum(dim=1).long()
+
+            for i in range(len(valid_lengths)):
+                exceed_len = int(valid_lengths[i].item()) - expected_len
+                if exceed_len > 0:
+                    overlong_reward = min(-exceed_len / buffer_len * penalty_factor, 0)
+                    rewards[i] += overlong_reward
+
+        return rewards
 

@@ -115,7 +115,7 @@ split:
 | dynamic_sampling | ✅ | 否 |
 | 固定 loss_scale_factor | ✅ | 否 |
 | 不按 std 归一化 | ✅ | 否 |
-| **Overlong penalty** | ❌ | **是** |
+| **Overlong penalty** | ✅ (D5) | 否 |
 | **Response length shaping** | ❌ | **是** |
 
 **Dr.GRPO 已完整支持**。

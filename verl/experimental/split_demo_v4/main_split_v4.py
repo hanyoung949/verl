@@ -79,7 +79,10 @@ def main(config: DictConfig):
     samples = load_jsonl_samples(config.data.train_file)
 
     rollout_backend = SimplePipelineRollout(engine, tokenizer)
-    reward_fn = FunctionReward(fn=math_exact_match, tokenizer=tokenizer)
+    overlong_cfg = dict(config.algorithm.overlong_penalty) if hasattr(config.algorithm, "overlong_penalty") else None
+    reward_fn = FunctionReward(
+        fn=math_exact_match, tokenizer=tokenizer,
+        overlong_cfg=overlong_cfg, max_resp_len=int(config.rollout.max_new_tokens))
 
     trainer = SplitTrainer(engine, rollout_backend, reward_fn, config)
     trainer.fit(samples)
