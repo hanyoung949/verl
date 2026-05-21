@@ -369,10 +369,24 @@ class SplitPipelineEngine(BaseEngine):
         return False
 
     def train_mode(self, **kwargs):
-        return nullcontext()
+        if self.stage is not None:
+            self.stage.train()
+        from verl.workers.engine.base import BaseEngineCtx
+        return BaseEngineCtx(self, "train", **kwargs)
 
     def eval_mode(self, **kwargs):
-        return nullcontext()
+        if self.stage is not None:
+            self.stage.eval()
+        from verl.workers.engine.base import BaseEngineCtx
+        return BaseEngineCtx(self, "eval", **kwargs)
+
+    def get_per_tensor_param(self, **kwargs):
+        peft_config = None
+        def _gen():
+            if self.stage is not None:
+                for name, param in self.stage.named_parameters():
+                    yield name, param
+        return _gen(), peft_config
 
     def get_data_parallel_size(self):
         return 1
