@@ -36,7 +36,7 @@ algorithm:
   update_epochs: 1
   mini_batch_size: 8
   overlong_penalty:
-    enable: false
+    enable: true
     buffer_len: 16
     penalty_factor: 1.0
 
