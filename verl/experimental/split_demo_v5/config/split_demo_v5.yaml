@@ -1,0 +1,56 @@
+model:
+  path: "/mnt/jfzn/cjy/models/Qwen3.5-2B"
+  trust_remote_code: true
+  mtp:
+    enable: true
+    enable_train: false
+    enable_rollout: true
+    num_speculative_tokens: 4
+
+data:
+  train_file: "verl/experimental/split_demo_v1/sample_data/train.jsonl"
+  max_prompt_length: 256
+
+split:
+  front_end: 4
+  middle_end: 20
+  topology:
+    head: [0]
+    middle: [1]
+    tail: [2]
+
+lora:
+  r: 16
+  lora_alpha: 32
+  lora_dropout: 0.0
+  target_modules: ["q_proj", "v_proj"]
+
+rollout:
+  backend: hf
+  group_size: 4
+  max_new_tokens: 128
+  temperature: 1.0
+  top_p: 1.0
+
+algorithm:
+  norm_adv_by_std_in_grpo: false
+  cliprange_low: 0.2
+  cliprange_high: 0.28
+  loss_agg_mode: "seq-mean-token-sum-norm"
+  loss_scale_factor: 128
+  dynamic_sampling: true
+  update_epochs: 1
+  mini_batch_size: 8
+  overlong_penalty:
+    enable: true
+    buffer_len: 16
+    penalty_factor: 1.0
+
+trainer:
+  train_batch_size: 4
+  total_steps: 10
+  lr: 1.0e-4
+  max_grad_norm: 1.0
+  log_freq: 1
+  save_dir: "verl/experimental/split_demo_v5/checkpoints"
+  seed: 42
