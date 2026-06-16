@@ -50,7 +50,7 @@ class SplitRayWorkerGroup:
     """A minimal worker group that places 3 split-training actors on 3 GPUs.
 
     This is intentionally lightweight for Phase B0/B1/B2: it does not reuse the
-    generic ``RayWorkerGroup`` because head/tail/middle are heterogeneous.
+    generic ``RayWorkerGroup`` because stage_0/stage_1/stage_2 are heterogeneous.
     """
 
     def __init__(
@@ -63,7 +63,7 @@ class SplitRayWorkerGroup:
         self.config = config
         self.name_prefix = name_prefix
         self.num_gpus = num_gpus
-        assert num_gpus == 3, "Phase B0 only supports a 3-stage pipeline (head/middle/tail)."
+        assert num_gpus == 3, "Phase B0 only supports a 3-stage pipeline (stage_0/stage_1/stage_2)."
 
         self.node_ip = node_ip or ray.util.get_node_ip_address()
         self.master_addr = self.node_ip
@@ -117,22 +117,45 @@ class SplitRayWorkerGroup:
 
     def train_micro_batch(self, data: dict) -> dict:
         """Run one forward/backward/optimizer step across the 3-stage pipeline."""
-        head_ref = self.actors[0].train_micro_batch.remote(data)
-        middle_ref = self.actors[1].train_micro_batch.remote()
-        tail_ref = self.actors[2].train_micro_batch.remote(data)
+        stage_0_ref = self.actors[0].train_micro_batch.remote(data)
+        stage_1_ref = self.actors[1].train_micro_batch.remote()
+        stage_2_ref = self.actors[2].train_micro_batch.remote(data)
 
-        head_out, middle_out, tail_out = ray.get([head_ref, middle_ref, tail_ref])
+        stage_0_out, stage_1_out, stage_2_out = ray.get([stage_0_ref, stage_1_ref, stage_2_ref])
         return {
-            "head": head_out,
-            "middle": middle_out,
-            "tail": tail_out,
+            "stage_0": stage_0_out,
+            "stage_1": stage_1_out,
+            "stage_2": stage_2_out,
+            "head": stage_0_out,
+            "middle": stage_1_out,
+            "tail": stage_2_out,
+        }
+
+    def infer_micro_batch(self, data: dict) -> dict:
+        """Run one forward-only pass across the 3-stage pipeline."""
+        stage_0_ref = self.actors[0].infer_micro_batch.remote(data)
+        stage_1_ref = self.actors[1].infer_micro_batch.remote()
+        stage_2_ref = self.actors[2].infer_micro_batch.remote(data)
+
+        stage_0_out, stage_1_out, stage_2_out = ray.get([stage_0_ref, stage_1_ref, stage_2_ref])
+        return {
+            "stage_0": stage_0_out,
+            "stage_1": stage_1_out,
+            "stage_2": stage_2_out,
+            "head": stage_0_out,
+            "middle": stage_1_out,
+            "tail": stage_2_out,
         }
 
     def get_trainable_state_dict(self):
-        """Return trainable state dicts from head and tail."""
+        """Return trainable state dicts from stage_0 and stage_2."""
+        stage_0_state = ray.get(self.actors[0].get_trainable_state_dict.remote())
+        stage_2_state = ray.get(self.actors[2].get_trainable_state_dict.remote())
         return {
-            "head": ray.get(self.actors[0].get_trainable_state_dict.remote()),
-            "tail": ray.get(self.actors[2].get_trainable_state_dict.remote()),
+            "stage_0": stage_0_state,
+            "stage_2": stage_2_state,
+            "head": stage_0_state,
+            "tail": stage_2_state,
         }
 
     def export_merged_lora_state_dict(self) -> dict[str, torch.Tensor]:
@@ -146,18 +169,18 @@ class SplitRayWorkerGroup:
         ranges = compute_split_layer_ranges(
             n_layers, self.config.split_stage_0_size, self.config.split_stage_2_size
         )
-        return merge_split_lora_state_dict(states["head"], states["tail"], ranges)
+        return merge_split_lora_state_dict(states["stage_0"], states["stage_2"], ranges)
 
     def export_merged_adapter(self, local_path: str, adapter_name: str = "split_adapter") -> str:
         """Export stage_0 + stage_2 LoRA weights as a single PEFT adapter.
 
         Middle-stage LoRA weights are zeroed out so the merged adapter only
-        affects the trainable head/tail layers.
+        affects the trainable stage_0/stage_2 layers.
         """
         os.makedirs(local_path, exist_ok=True)
         states = self.get_trainable_state_dict()
-        head_state = states["head"]
-        tail_state = states["tail"]
+        stage_0_state = states["stage_0"]
+        stage_2_state = states["stage_2"]
 
         # Delay imports so that CPU-side merge does not require CUDA in the driver.
         from peft import LoraConfig, TaskType, get_peft_model
@@ -204,7 +227,7 @@ class SplitRayWorkerGroup:
                 zeroed += 1
                 continue
 
-            src = head_state if stage == "stage_0" else tail_state
+            src = stage_0_state if stage == "stage_0" else stage_2_state
             src_key = f"layers.{local_idx}.self_attn.{proj}.lora_{ab}.default.weight"
 
             if src_key in src:

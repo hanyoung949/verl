@@ -28,7 +28,7 @@ class SplitStageWorker(Worker):
     """Ray worker for stage_0 (head) or stage_2 (tail) of split training.
 
     This worker runs in its own process, holds a SplitPipelineEngine configured
-    for either head or tail, and participates in a 3-rank NCCL process group.
+    for either stage_0 or stage_2, and participates in a 3-rank NCCL process group.
     """
 
     def __init__(self, config):
@@ -113,7 +113,7 @@ class SplitStageWorker(Worker):
         return {"rank": self._rank, "stage": "head" if self.is_head else "tail"}
 
     def train_micro_batch(self, data: dict) -> dict:
-        """Run one forward/backward/optimizer step for head or tail.
+        """Run one forward/backward/optimizer step for stage_0 or stage_2.
 
         The middle worker must be invoked concurrently for the pipeline to make
         progress, because this method blocks on NCCL send/recv with rank 1.
@@ -123,7 +123,7 @@ class SplitStageWorker(Worker):
         return outputs
 
     def infer_micro_batch(self, data: dict) -> dict:
-        """Run one forward-only pass for head or tail."""
+        """Run one forward-only pass for stage_0 or stage_2."""
         loss_fn = self._choose_loss_fn(data)
         outputs = self.engine.infer_batch(data, loss_fn)
         return outputs

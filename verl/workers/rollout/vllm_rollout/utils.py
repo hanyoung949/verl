@@ -332,6 +332,22 @@ class vLLMColocateWorkerExtension:
         )
         return self.add_lora(lora_request)
 
+    def read_lora_weight_norms(self) -> dict[str, float]:
+        """Read L2 norms of currently loaded LoRA weights for verification.
+
+        Returns a dict mapping parameter name to its L2 norm (float).
+        Returns an empty dict if no LoRA adapter is loaded.
+        """
+        result: dict[str, float] = {}
+        try:
+            model = self.model_runner.model
+            for name, param in model.named_parameters():
+                if "lora" in name and param.requires_grad:
+                    result[name] = float(param.data.norm().item())
+        except Exception as e:
+            logger.warning("read_lora_weight_norms failed: %s", e)
+        return result
+
 
 class vLLMOmniColocateWorkerExtension(_OmniWorkerBase):
     """

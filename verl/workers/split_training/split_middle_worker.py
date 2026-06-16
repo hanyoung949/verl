@@ -21,12 +21,11 @@ from verl.utils.distributed import initialize_global_process_group
 
 
 class SplitMiddleWorker(Worker):
-    """Ray worker for stage_1 (middle) of split training.
+    """Ray worker for stage_1 of split training.
 
-    The middle stage is frozen and only forwards activations / backward gradients
-    between head and tail.  It exposes a synchronous ``train_micro_batch`` that
-    handles one pipeline iteration, so the driver can invoke head/middle/tail
-    concurrently.
+    Stage_1 is frozen and only forwards activations / backward gradients
+    between stage_0 and stage_2. It exposes synchronous train/infer methods so
+    the driver can invoke all stages concurrently.
     """
 
     def __init__(self, config):
@@ -60,24 +59,33 @@ class SplitMiddleWorker(Worker):
     def reset(self):
         """Re-initialize the engine (reload frozen middle weights)."""
         self.engine.initialize()
-        return {"rank": self._rank, "stage": "middle"}
+        return {"rank": self._rank, "stage": "stage_1"}
+
+    def infer_micro_batch(self, data=None) -> dict:
+        """Handle one forward-only pipeline iteration.
+
+        ``data`` is ignored; rank 0 provides inputs through NCCL. This must be
+        called concurrently with stage_0/stage_2 ``infer_micro_batch``.
+        """
+        self.engine.stage.run_once(self.engine.topology)
+        return {}
 
     def train_micro_batch(self, data=None) -> dict:
         """Handle one forward/backward pipeline iteration.
 
         ``data`` is ignored; the real inputs come from rank 0 via NCCL.  This
-        method must be called concurrently with head/tail ``train_micro_batch``.
+        method must be called concurrently with stage_0/stage_2 ``train_micro_batch``.
         """
         # run_once raises if it sees an unexpected flag, otherwise returns True.
         self.engine.stage.run_once(self.engine.topology)
         return {}
 
     def get_trainable_state_dict(self):
-        """Middle is frozen; return an empty state dict."""
+        """Stage_1 is frozen; return an empty state dict."""
         return {}
 
     def has_grad(self):
-        """Return True if any middle parameter has a grad (should be False)."""
+        """Return True if any stage_1 parameter has a grad (should be False)."""
         for p in self.engine.stage.layers.parameters():
             if p.grad is not None:
                 return True
