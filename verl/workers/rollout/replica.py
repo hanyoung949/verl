@@ -31,6 +31,55 @@ from verl.workers.config import DiffusionRolloutConfig, HFModelConfig, RolloutCo
 logger = logging.getLogger(__file__)
 
 
+def _parse_split_stage_node_map(raw: str) -> dict[str, str]:
+    """Parse ``VLLM_SPLIT_STAGE_NODE_MAP`` / ``split_stage_node_map`` into stage -> node-IP mapping.
+
+    Expected format: ``stage_0:<ip>,stage_1:<ip>,stage_2:<ip>``.
+    """
+    stage_map: dict[str, str] = {}
+    for part in raw.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if ":" not in part:
+            raise ValueError(
+                f"Invalid split stage-node map entry '{part}'. "
+                "Expected format: stage_0:<ip>,stage_1:<ip>,stage_2:<ip>"
+            )
+        stage, ip = part.split(":", 1)
+        stage = stage.strip().lower()
+        ip = ip.strip()
+        if stage not in ("stage_0", "stage_1", "stage_2"):
+            raise ValueError(
+                f"Invalid stage '{stage}' in split stage-node map. "
+                "Valid stages are stage_0, stage_1, stage_2."
+            )
+        stage_map[stage] = ip
+    return stage_map
+
+
+def _get_split_process_on_nodes(
+    stage_node_map: str,
+    split_stage_1_tensor_parallel_size: int,
+) -> tuple[list[int], list[str]]:
+    """Compute non-uniform per-node GPU counts and sorted node IPs for split rollout.
+
+    Returns:
+        - process_on_nodes: number of GPUs required on each node, ordered by sorted node IP.
+        - node_ips: sorted node IPs, matching the order of process_on_nodes.
+    """
+    stage_map = _parse_split_stage_node_map(stage_node_map)
+    ip_to_gpus: dict[str, int] = {}
+    ip_to_gpus[stage_map["stage_0"]] = ip_to_gpus.get(stage_map["stage_0"], 0) + 1
+    ip_to_gpus[stage_map["stage_2"]] = ip_to_gpus.get(stage_map["stage_2"], 0) + 1
+    stage_1_ip = stage_map["stage_1"]
+    ip_to_gpus[stage_1_ip] = ip_to_gpus.get(stage_1_ip, 0) + split_stage_1_tensor_parallel_size
+
+    sorted_ips = sorted(ip_to_gpus.keys())
+    process_on_nodes = [ip_to_gpus[ip] for ip in sorted_ips]
+    return process_on_nodes, sorted_ips
+
+
 # Max number of concurrent calls to the methods of Rollout,
 # excluding calls to generate method.
 CONTROL_METHOD_CONCURRENCY = 16
@@ -211,12 +260,40 @@ class RolloutReplica(ABC):
             resource_pool_name = f"rollout_pool_teacher_{self.replica_rank}{self.name_suffix}"
         else:
             resource_pool_name = f"rollout_pool_{self.replica_rank}{self.name_suffix}"
-        resource_pool_spec = {
-            resource_pool_name: [self.gpus_per_replica_node] * self.nnodes,
-        }
-        resource_pool_manager = ResourcePoolManager(resource_pool_spec=resource_pool_spec, mapping=None)
-        resource_pool_manager.create_resource_pool()
-        self.resource_pool = resource_pool_manager.resource_pool_dict[resource_pool_name]
+
+        # For layer-wise split with an explicit stage-node map, use a non-uniform
+        # resource pool so each node reserves exactly the GPUs needed for the
+        # stages pinned to it. Otherwise fall back to the legacy uniform pool.
+        is_split_with_map = (
+            getattr(self.config, "enable_layerwise_split", False)
+            and getattr(self.config, "split_stage_node_map", None) is not None
+        )
+        if is_split_with_map:
+            process_on_nodes, node_ips = _get_split_process_on_nodes(
+                self.config.split_stage_node_map,
+                getattr(self.config, "split_stage_1_tensor_parallel_size", 1),
+            )
+            logger.info(
+                "Creating non-uniform standalone resource pool for split rollout: "
+                "process_on_nodes=%s, node_ips=%s",
+                process_on_nodes,
+                node_ips,
+            )
+            self.resource_pool = RayResourcePool(
+                process_on_nodes=process_on_nodes,
+                node_ips=node_ips,
+                use_gpu=True,
+                max_colocate_count=3,
+                name_prefix=resource_pool_name,
+            )
+            self.resource_pool.get_placement_groups(device_name="cuda" if not is_torch_npu_available(check_device=False) else "npu")
+        else:
+            resource_pool_spec = {
+                resource_pool_name: [self.gpus_per_replica_node] * self.nnodes,
+            }
+            resource_pool_manager = ResourcePoolManager(resource_pool_spec=resource_pool_spec, mapping=None)
+            resource_pool_manager.create_resource_pool()
+            self.resource_pool = resource_pool_manager.resource_pool_dict[resource_pool_name]
 
         # create worker group for this rollout
         use_gpu = self.rollout_worker_use_gpu()

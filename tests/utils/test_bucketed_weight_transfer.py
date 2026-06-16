@@ -217,3 +217,123 @@ class TestBucketedWeightTransferIPC:
         numel = (1 << 20) // 4
         specs = [("exact_fit", (numel,), torch.float32)]
         _transfer_and_validate(specs, bucket_size_mb=1, use_shm=False)
+
+
+# -----------------------------------------------------------------------------
+# TCP cross-node backend tests (localhost loopback)
+# -----------------------------------------------------------------------------
+def _tcp_sender_fn(port_queue, weight_specs, seed, bucket_size_mb):
+    """Sender process for TCP tests: bind, publish address, send weights."""
+    import asyncio
+
+    from verl.workers.rollout.vllm_rollout.bucketed_weight_transfer import (
+        TcpBucketedWeightSender,
+        _get_free_tcp_port,
+    )
+
+    port = _get_free_tcp_port()
+    bind_handle = f"tcp://*:{port}"
+    # Loopback address for the receiver on the same machine.
+    addr = f"tcp://127.0.0.1:{port}"
+    port_queue.put(addr)
+
+    weights = _generate_weights(weight_specs, seed)
+    sender = TcpBucketedWeightSender(
+        zmq_handle=bind_handle,
+        bucket_size_mb=bucket_size_mb,
+    )
+    asyncio.run(sender.async_send_weights(iter(weights)))
+
+
+def _tcp_receiver_fn(addr, result_queue, bucket_size_mb):
+    """Receiver process for TCP tests: connect to published address and receive."""
+    from verl.workers.rollout.vllm_rollout.bucketed_weight_transfer import (
+        TcpBucketedWeightReceiver,
+    )
+
+    device = torch.device(f"{get_device_name()}:0")
+    receiver = TcpBucketedWeightReceiver(
+        zmq_handle=addr,
+        device=device,
+    )
+    received = []
+    receiver.receive_weights(on_bucket_received=lambda w: received.extend([(name, t.clone()) for name, t in w]))
+    # Only send lightweight metadata + checksum back through the queue
+    summaries = [(name, t.dtype, tuple(t.shape), t.float().sum().item()) for name, t in received]
+    result_queue.put(summaries)
+
+
+def _transfer_and_validate_tcp(weight_specs, bucket_size_mb):
+    """Spawn TCP sender (binds first) + receiver (connects), then validate."""
+    seed = 42
+    ctx = mp.get_context("spawn")
+    port_queue = ctx.Queue()
+    result_queue = ctx.Queue()
+
+    sender_p = ctx.Process(
+        target=_tcp_sender_fn,
+        args=(port_queue, weight_specs, seed, bucket_size_mb),
+    )
+    sender_p.start()
+    addr = port_queue.get(timeout=PROCESS_TIMEOUT)
+
+    receiver_p = ctx.Process(
+        target=_tcp_receiver_fn,
+        args=(addr, result_queue, bucket_size_mb),
+    )
+    receiver_p.start()
+
+    sender_p.join(timeout=PROCESS_TIMEOUT)
+    receiver_p.join(timeout=PROCESS_TIMEOUT)
+
+    assert sender_p.exitcode == 0, f"TCP sender process failed with exit code {sender_p.exitcode}"
+    assert receiver_p.exitcode == 0, f"TCP receiver process failed with exit code {receiver_p.exitcode}"
+
+    summaries = result_queue.get(timeout=5)
+    expected = _generate_weights(weight_specs, seed)
+
+    assert len(summaries) == len(expected), f"Expected {len(expected)} weights, got {len(summaries)}"
+
+    for (exp_name, exp_tensor), (recv_name, recv_dtype, recv_shape, recv_cksum) in zip(
+        expected, summaries, strict=False
+    ):
+        assert exp_name == recv_name, f"Name mismatch: expected {exp_name}, got {recv_name}"
+        assert tuple(exp_tensor.shape) == recv_shape, (
+            f"Shape mismatch for {exp_name}: expected {tuple(exp_tensor.shape)}, got {recv_shape}"
+        )
+        assert exp_tensor.dtype == recv_dtype, (
+            f"Dtype mismatch for {exp_name}: expected {exp_tensor.dtype}, got {recv_dtype}"
+        )
+        exp_sum = exp_tensor.float().sum().item()
+        assert exp_sum == recv_cksum, f"Data mismatch for {exp_name}"
+
+
+class TestTcpBucketedWeightTransfer:
+    """Test TcpBucketedWeightSender/Receiver via localhost TCP loopback."""
+
+    def test_single_small_weight(self):
+        specs = [("layer.weight", (32, 16), torch.float32)]
+        _transfer_and_validate_tcp(specs, bucket_size_mb=1)
+
+    def test_multiple_weights_single_bucket(self):
+        specs = [
+            ("layer0.weight", (16, 16), torch.float32),
+            ("layer0.bias", (16,), torch.float32),
+            ("layer1.weight", (16, 8), torch.bfloat16),
+        ]
+        _transfer_and_validate_tcp(specs, bucket_size_mb=1)
+
+    def test_multiple_buckets(self):
+        specs = [(f"layer{i}.weight", (128, 128), torch.float32) for i in range(20)]
+        _transfer_and_validate_tcp(specs, bucket_size_mb=1)
+
+    def test_mixed_dtypes(self):
+        specs = [
+            ("fp32_param", (64, 64), torch.float32),
+            ("bf16_param", (64, 64), torch.bfloat16),
+            ("fp16_param", (32, 32), torch.float16),
+        ]
+        _transfer_and_validate_tcp(specs, bucket_size_mb=1)
+
+    def test_empty_weights(self):
+        _transfer_and_validate_tcp([], bucket_size_mb=1)

@@ -176,11 +176,23 @@ class vLLMColocateWorkerExtension:
         # patch weight loader to support MoE model
         patch_vllm_moe_model_weight_loader(self.model_runner.model)
 
-    def update_weights_from_ipc(self, peft_config: dict = None, base_sync_done=False, use_shm: bool = False):
+    def update_weights_from_ipc(
+        self,
+        peft_config: dict = None,
+        base_sync_done=False,
+        use_shm: bool = False,
+        weight_sync_addrs: list[str] = None,
+    ):
         """Update the weights of the rollout model."""
         from vllm.platforms import current_platform
 
-        from verl.workers.rollout.vllm_rollout.bucketed_weight_transfer import BucketedWeightReceiver
+        from verl.workers.rollout.vllm_rollout.bucketed_weight_transfer import (
+            BucketedWeightReceiver,
+            TcpBucketedWeightReceiver,
+            _format_tcp_address,
+            _get_free_tcp_port,
+            _get_worker_node_ip,
+        )
 
         if current_platform.device_type == "npu" and self.device is None:
             self.device = torch.device(f"npu:{self.local_rank}")
@@ -209,11 +221,33 @@ class vLLMColocateWorkerExtension:
             patch_vllm_moe_model_weight_loader(self.model_runner.model)
 
         assert self.device is not None
-        receiver = BucketedWeightReceiver(
-            zmq_handle=self._get_zmq_handle(),
-            device=self.device,
-            use_shm=use_shm,
-        )
+
+        if weight_sync_addrs is not None:
+            # Cross-node TCP path (C2-2): the coordinator bound one endpoint per
+            # worker and passed the connect addresses to us.  We pick our own
+            # address by global rank and connect back to the server.
+            rank = getattr(self, "rank", self.local_rank)
+            assert 0 <= rank < len(weight_sync_addrs), (
+                f"Worker rank {rank} out of range for {len(weight_sync_addrs)} addresses"
+            )
+            connect_addr = weight_sync_addrs[rank]
+            logger.info(
+                "Worker rank=%d connecting to TCP weight endpoint %s",
+                rank,
+                connect_addr,
+            )
+            receiver = TcpBucketedWeightReceiver(
+                zmq_handle=connect_addr,
+                device=self.device,
+            )
+        else:
+            # Single-node IPC path (default, backwards compatible).
+            receiver = BucketedWeightReceiver(
+                zmq_handle=self._get_zmq_handle(),
+                device=self.device,
+                use_shm=use_shm,
+            )
+
         receiver.receive_weights(
             on_bucket_received=lambda weights: self._update_weights(
                 weights, peft_config=peft_config, base_sync_done=base_sync_done
@@ -271,6 +305,32 @@ class vLLMColocateWorkerExtension:
         """
         replica_rank = os.environ.get("VERL_REPLICA_RANK", "0")
         return f"ipc:///tmp/rl-colocate-zmq-replica-{replica_rank}-rank-{self.local_rank}.sock"
+
+    def update_lora_adapter(
+        self,
+        lora_state_dict: dict[str, torch.Tensor],
+        peft_config: dict,
+    ) -> bool:
+        """Load a LoRA adapter from an in-memory state dict.
+
+        This is invoked by split training's WeightSyncManager via
+        ``vLLMHttpServer.update_lora_adapter`` / ``collective_rpc``.  Constructing
+        the ``TensorLoRARequest`` inside the worker (instead of in the server
+        actor) avoids msgspec deserialization dropping the subclass fields.
+        """
+        try:
+            self.remove_lora(VLLM_LORA_INT_ID)
+        except Exception:
+            pass
+
+        lora_request = TensorLoRARequest(
+            lora_name=VLLM_LORA_NAME,
+            lora_int_id=VLLM_LORA_INT_ID,
+            lora_path=VLLM_LORA_PATH,
+            peft_config=peft_config,
+            lora_tensors=lora_state_dict,
+        )
+        return self.add_lora(lora_request)
 
 
 class vLLMOmniColocateWorkerExtension(_OmniWorkerBase):

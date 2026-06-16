@@ -1249,6 +1249,18 @@ class AgentLoopManager:
         return timing
 
     @auto_await
+    async def update_lora_adapter(
+        self,
+        lora_state_dict: dict[str, torch.Tensor],
+        peft_config: dict,
+    ) -> bool:
+        """Push an in-memory LoRA adapter to all rollout replicas."""
+        results = await asyncio.gather(
+            *[replica.update_lora_adapter(lora_state_dict, peft_config) for replica in self.rollout_replicas]
+        )
+        return all(results)
+
+    @auto_await
     async def clear_kv_cache(self):
         """Clear all rollout kv cache, but don`t sleep."""
         await asyncio.gather(*[replica.clear_kv_cache() for replica in self.rollout_replicas])

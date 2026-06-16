@@ -286,6 +286,20 @@ class RolloutConfig(BaseConfig):
 
     qat: Optional[dict] = None
 
+    # Layer-wise split vLLM rollout configuration.
+    # These are first-class fields; they can also be supplied via engine_kwargs.vllm
+    # for backward compatibility. When enable_layerwise_split=False (default), the
+    # rollout behaves exactly like a normal vLLM rollout.
+    enable_layerwise_split: bool = False
+    split_stage_0_size: int = 0
+    split_stage_2_size: int = 0
+    split_stage_1_tensor_parallel_size: int = 1
+
+    # Optional cross-node placement map for layer-wise split rollout.
+    # Format: "stage_0:<ip>,stage_1:<ip>,stage_2:<ip>".
+    # When unset, split rollout uses the default uniform placement.
+    split_stage_node_map: Optional[str] = None
+
     def __post_init__(self):
         """Validate the rollout config"""
         # Deprecation warning for mode field - only async mode is supported
@@ -327,8 +341,100 @@ class RolloutConfig(BaseConfig):
                     f"tensor_model_parallel_size={self.tensor_model_parallel_size})"
                 )
 
+        # Layer-wise split support for vLLM: allow pipeline_model_parallel_size > 1
+        # when split mode is explicitly enabled. First-class fields take precedence;
+        # engine_kwargs.vllm is still accepted for backward compatibility.
+        vllm_engine_kwargs = self.engine_kwargs.get("vllm", {}) if hasattr(self.engine_kwargs, "get") else {}
+        is_split_rollout = self.name == "vllm" and (
+            self.enable_layerwise_split
+            or vllm_engine_kwargs.get("enable_layerwise_split", False)
+        )
+
+        if is_split_rollout:
+            # Normalize split parameters, preferring first-class fields.
+            eff_split_stage_0_size = self.split_stage_0_size or int(
+                vllm_engine_kwargs.get("split_stage_0_size", 0)
+            )
+            eff_split_stage_2_size = self.split_stage_2_size or int(
+                vllm_engine_kwargs.get("split_stage_2_size", 0)
+            )
+            eff_split_stage_1_tp = (
+                self.split_stage_1_tensor_parallel_size
+                or int(vllm_engine_kwargs.get("split_stage_1_tensor_parallel_size", 1))
+            )
+            eff_split_stage_node_map = (
+                self.split_stage_node_map
+                or vllm_engine_kwargs.get("split_stage_node_map", None)
+            )
+
+            # First-class fields and engine_kwargs should not conflict.
+            for field_name, effective_value in [
+                ("split_stage_0_size", eff_split_stage_0_size),
+                ("split_stage_2_size", eff_split_stage_2_size),
+                ("split_stage_1_tensor_parallel_size", eff_split_stage_1_tp),
+                ("split_stage_node_map", eff_split_stage_node_map),
+            ]:
+                engine_value = vllm_engine_kwargs.get(field_name)
+                if engine_value is not None and int(engine_value) != effective_value:
+                    raise ValueError(
+                        f"Conflicting split configuration: RolloutConfig.{field_name}="
+                        f"{getattr(self, field_name)} but engine_kwargs.vllm.{field_name}="
+                        f"{engine_value}. Please use RolloutConfig first-class fields."
+                    )
+
+            if eff_split_stage_0_size <= 0 or eff_split_stage_2_size <= 0:
+                raise ValueError(
+                    "Layer-wise split rollout requires positive split_stage_0_size and "
+                    f"split_stage_2_size, got {eff_split_stage_0_size} and {eff_split_stage_2_size}"
+                )
+
+            # Validate stage-node map format if provided.
+            if eff_split_stage_node_map is not None:
+                from verl.workers.rollout.replica import _parse_split_stage_node_map
+                stage_map = _parse_split_stage_node_map(eff_split_stage_node_map)
+                for stage in ("stage_0", "stage_1", "stage_2"):
+                    if stage not in stage_map:
+                        raise ValueError(
+                            f"Layer-wise split rollout stage-node map missing '{stage}'. "
+                            f"Expected format: stage_0:<ip>,stage_1:<ip>,stage_2:<ip>"
+                        )
+
         if self.pipeline_model_parallel_size > 1:
-            if self.name == "vllm" or self.name == "sglang" or self.name == "trtllm":
+            if is_split_rollout:
+                stage_1_tp = (
+                    self.split_stage_1_tensor_parallel_size
+                    or int(vllm_engine_kwargs.get("split_stage_1_tensor_parallel_size", 1))
+                )
+                if self.pipeline_model_parallel_size != 3:
+                    raise ValueError(
+                        f"Layer-wise split rollout requires pipeline_model_parallel_size=3, "
+                        f"got {self.pipeline_model_parallel_size}"
+                    )
+                if self.tensor_model_parallel_size != 1:
+                    raise ValueError(
+                        f"Layer-wise split rollout requires tensor_model_parallel_size=1, "
+                        f"got {self.tensor_model_parallel_size}"
+                    )
+                if self.data_parallel_size != 1:
+                    raise ValueError(
+                        f"Layer-wise split rollout requires data_parallel_size=1, "
+                        f"got {self.data_parallel_size}"
+                    )
+                # World size sanity check: stage_0 + stage_1_TP + stage_2.
+                expected_world_size = 1 + stage_1_tp + 1
+                rollout_world_size = (
+                    self.tensor_model_parallel_size
+                    * self.data_parallel_size
+                    * self.pipeline_model_parallel_size
+                )
+                if rollout_world_size != expected_world_size:
+                    raise ValueError(
+                        f"Layer-wise split rollout world size mismatch: "
+                        f"tensor_model_parallel_size * data_parallel_size * pipeline_model_parallel_size = "
+                        f"{rollout_world_size}, but expected {expected_world_size} "
+                        f"(1 + split_stage_1_tensor_parallel_size + 1 = 1 + {stage_1_tp} + 1)"
+                    )
+            elif self.name == "vllm" or self.name == "sglang" or self.name == "trtllm":
                 raise NotImplementedError(
                     f"Current rollout {self.name=} not implemented pipeline_model_parallel_size > 1 yet."
                 )

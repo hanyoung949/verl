@@ -118,6 +118,7 @@ class RayResourcePool(ResourcePool):
         max_colocate_count: int = 10,
         detached=False,
         accelerator_type: Optional[str] = None,
+        node_ips: Optional[list[str]] = None,
     ) -> None:
         super().__init__(process_on_nodes, max_colocate_count)
         self.use_gpu = use_gpu
@@ -126,6 +127,11 @@ class RayResourcePool(ResourcePool):
         self.pgs = None
         self.detached = detached
         self.accelerator_type = accelerator_type
+        self.node_ips = node_ips
+        if node_ips is not None and len(node_ips) != len(self._store):
+            raise ValueError(
+                f"node_ips length ({len(node_ips)}) must match process_on_nodes length ({len(self._store)})."
+            )
 
     def get_placement_groups(self, strategy="STRICT_PACK", name=None, device_name="cuda"):
         if self.pgs is not None:
@@ -145,7 +151,16 @@ class RayResourcePool(ResourcePool):
             bundle[device_name] = 1
             if self.accelerator_type is not None:
                 bundle[self.accelerator_type] = 1e-4
-        pg_scheme = [[bundle.copy() for _ in range(process_count)] for process_count in self._store]
+        pg_scheme = []
+        for idx, process_count in enumerate(self._store):
+            bundles = [bundle.copy() for _ in range(process_count)]
+            if self.node_ips is not None:
+                # Pin each bundle in this placement group to the target node.
+                # Ray automatically exposes a "node:<ip>" resource per node.
+                node_ip = self.node_ips[idx]
+                for b in bundles:
+                    b[f"node:{node_ip}"] = 0.001
+            pg_scheme.append(bundles)
 
         lifetime = "detached" if self.detached else None
 
@@ -555,8 +570,8 @@ class RayWorkerGroup(WorkerGroup):
         # cia.add_kwarg("_world_size", world_size)
 
         rank = -1
-        local_world_size = resource_pool.store[0]
         for pg_idx, pg in enumerate(sort_placement_group_by_node_ip(pgs)):
+            local_world_size = resource_pool.store[pg_idx]
             assert local_world_size <= pg.bundle_count, f"when generating for {self.name_prefix}, for the "
             if pg_idx == 0:
                 self._get_master_addr_port(pg, bundle_index=0, master_port_range=self._ray_master_port_range)
@@ -619,7 +634,11 @@ class RayWorkerGroup(WorkerGroup):
         use_gpu = resource_pool.use_gpu
         if self.use_gpu and not use_gpu:
             raise ValueError("use_gpu is True but resource_pool.use_gpu is False")
-        local_world_size = resource_pool.store[0]
+        local_world_size = (
+            resource_pool.store[pg_idx]
+            if pg_idx < len(resource_pool.store)
+            else resource_pool.store[0]
+        )
         num_gpus = 1 / resource_pool.max_colocate_count
 
         # we pass in environment variable at option so that Worker can use environment variable to set

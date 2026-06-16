@@ -17,10 +17,12 @@ import inspect
 import json
 import logging
 import os
+import uuid
 from pprint import pprint
 from typing import Any, Callable, Optional
 
 import ray
+import torch
 import vllm.entrypoints.cli.serve
 from packaging import version
 from ray.actor import ActorHandle
@@ -54,6 +56,10 @@ from verl.workers.rollout.vllm_rollout.utils import (
 )
 
 _VLLM_VERSION = version.parse(vllm.__version__)
+
+# Treat upstream dev builds (e.g. 0.1.devXXXX+gHASH) as a recent vLLM version.
+if _VLLM_VERSION.is_devrelease:
+    _VLLM_VERSION = version.parse("0.13.0")
 
 if _VLLM_VERSION > version.parse("0.11.0"):
     from vllm.utils.argparse_utils import FlexibleArgumentParser
@@ -203,6 +209,20 @@ class vLLMHttpServer:
         # 1. setup vllm serve cli args
         engine_kwargs = self.config.get("engine_kwargs", {}).get(self._get_engine_kwargs_key(), {}) or {}
         engine_kwargs = {key: val for key, val in engine_kwargs.items() if val is not None}
+
+        # Promote first-class layer-wise split config into vllm engine_kwargs.
+        # engine_kwargs is still accepted for backward compatibility, but
+        # RolloutConfig-level fields take precedence and conflicts are caught
+        # in RolloutConfig.__post_init__.
+        if self.config.name == "vllm" and self.config.get("enable_layerwise_split", False):
+            engine_kwargs["enable_layerwise_split"] = True
+            if self.config.get("split_stage_0_size", 0) > 0:
+                engine_kwargs["split_stage_0_size"] = self.config.split_stage_0_size
+            if self.config.get("split_stage_2_size", 0) > 0:
+                engine_kwargs["split_stage_2_size"] = self.config.split_stage_2_size
+            if self.config.get("split_stage_1_tensor_parallel_size", 1) > 1:
+                engine_kwargs["split_stage_1_tensor_parallel_size"] = self.config.split_stage_1_tensor_parallel_size
+
         if self.config.get("limit_images", None):  # support for multi-image data
             engine_kwargs["limit_mm_per_prompt"] = {"image": self.config.get("limit_images")}
         if self.config.cudagraph_capture_sizes:
@@ -243,7 +263,7 @@ class vLLMHttpServer:
             "dtype": self.config.dtype,
             "load_format": self.config.load_format,
             "skip_tokenizer_init": False,
-            "distributed_executor_backend": "mp",
+            "distributed_executor_backend": "ray" if self.nnodes > 1 else "mp",
             "worker_extension_cls": self._get_worker_extension_cls(),
             "trust_remote_code": self.model_config.trust_remote_code,
             "max_model_len": self.config.max_model_len,
@@ -257,6 +277,7 @@ class vLLMHttpServer:
             "gpu_memory_utilization": self.config.gpu_memory_utilization,
             "disable_log_stats": self.config.disable_log_stats,
             "tensor_parallel_size": self.config.tensor_model_parallel_size,
+            "pipeline_parallel_size": self.config.pipeline_model_parallel_size,
             "seed": self.replica_rank + self.config.get("seed", 0),
             "override_generation_config": json.dumps(override_generation_config),
             "quantization": quantization,
@@ -445,6 +466,7 @@ class vLLMHttpServer:
         image_data: Optional[list[Any]] = None,
         video_data: Optional[list[Any]] = None,
         priority: int = 0,
+        lora_request: Optional[LoRARequest] = None,
     ) -> TokenOutput:
         """Generate sequence with token-in-token-out."""
         prompt_ids = normalize_token_ids(prompt_ids)
@@ -491,8 +513,7 @@ class vLLMHttpServer:
         prompt = TokensPrompt(prompt_token_ids=prompt_ids, multi_modal_data=multi_modal_data)
 
         # Add lora request
-        lora_request = None
-        if self.lora_as_adapter:
+        if lora_request is None and self.lora_as_adapter:
             # Make sure we also check that the lora is already loaded in the engine
             lora_loaded = VLLM_LORA_INT_ID in await self.engine.list_loras()
             if lora_loaded:
@@ -565,6 +586,164 @@ class vLLMHttpServer:
             await self.engine.reset_prefix_cache()
         elif self.rollout_mode == RolloutMode.STANDALONE:
             logger.info("skip wake_up in standalone mode")
+
+    async def add_lora(self, lora_request: LoRARequest) -> bool:
+        """Load a LoRA adapter into the running vLLM engine."""
+        if self.node_rank != 0:
+            return True
+        return await self.engine.add_lora(lora_request)
+
+    async def update_lora_adapter(
+        self,
+        lora_state_dict: dict[str, torch.Tensor],
+        peft_config: dict,
+    ) -> bool:
+        """Load a LoRA adapter from an in-memory state dict into the running engine.
+
+        This is used by split training to push head/tail LoRA weights directly to
+        the rollout engine without writing an adapter directory to disk.  We reuse
+        the existing bucketed weight transfer path (:meth:`update_weights_from_ipc`)
+        so tensors stay as ``torch.Tensor`` on the worker side instead of being
+        serialized to Python lists by the engine RPC layer.
+
+        For single-node deployments the legacy IPC/SHM backend is used.  When the
+        rollout spans multiple nodes, a TCP raw-bytes backend plus a per-sync Ray
+        endpoint registry discovers every worker's address before sending.
+        """
+        if self.node_rank != 0:
+            return True
+
+        from verl.workers.rollout.vllm_rollout.bucketed_weight_transfer import (
+            BucketedWeightSender,
+            TcpBucketedWeightSender,
+            WeightEndpointRegistry,
+        )
+
+        use_shm = self.config.get("use_shm_weight_update", False)
+        bucket_size_mb = self.config.get("update_weights_bucket_megabytes", 512)
+        use_tcp = (
+            self.nnodes > 1
+            or os.environ.get("VERL_SPLIT_WEIGHT_SYNC_TCP", "0") == "1"
+        )
+
+        if use_tcp:
+            # Cross-node path: bind one TCP endpoint per vLLM worker, pass the
+            # connect addresses to the workers, and send the same LoRA weights to
+            # all of them concurrently.  This avoids needing a shared registry
+            # actor inside the vLLM subprocesses.
+            from verl.workers.rollout.vllm_rollout.bucketed_weight_transfer import (
+                _format_tcp_address,
+                _get_free_tcp_port,
+                _get_worker_node_ip,
+            )
+
+            world_size = len(self.workers)
+            server_ip = _get_worker_node_ip()
+            senders: list[TcpBucketedWeightSender] = []
+            connect_addrs: list[str] = []
+            for _ in range(world_size):
+                port = _get_free_tcp_port()
+                bind_addr = f"tcp://*:{port}"
+                connect_addr = _format_tcp_address(server_ip, port)
+                senders.append(
+                    TcpBucketedWeightSender(
+                        zmq_handle=bind_addr,
+                        bucket_size_mb=bucket_size_mb,
+                    )
+                )
+                connect_addrs.append(connect_addr)
+
+            logger.info(
+                "update_lora_adapter (TCP): bound %d endpoints on %s",
+                world_size,
+                server_ip,
+            )
+
+            receive_task = asyncio.create_task(
+                self.engine.collective_rpc(
+                    "update_weights_from_ipc",
+                    kwargs={
+                        "peft_config": peft_config,
+                        "base_sync_done": True,
+                        "use_shm": False,
+                        "weight_sync_addrs": connect_addrs,
+                    },
+                )
+            )
+
+            try:
+                async def _send_with_sender(sender: TcpBucketedWeightSender):
+                    async def _weights():
+                        for name, tensor in lora_state_dict.items():
+                            yield name, tensor
+
+                    await sender.async_send_weights(_weights())
+
+                await asyncio.gather(*(_send_with_sender(s) for s in senders))
+                await receive_task
+                return True
+            except Exception:
+                logger.exception("update_lora_adapter (TCP) failed")
+                receive_task.cancel()
+                return False
+
+        # Single-node IPC/SHM path (default, backwards compatible).
+        # Number of local vLLM workers that will receive weights.  This equals
+        # the number of GPUs managed by this server actor (TP * local PP).  The
+        # receiver socket is indexed by the worker's local rank, so we send to
+        # every local rank in [0, num_local_workers).
+        num_local_workers = self.gpus_per_node
+
+        receive_task = asyncio.create_task(
+            self.engine.collective_rpc(
+                "update_weights_from_ipc",
+                kwargs={
+                    "peft_config": peft_config,
+                    "base_sync_done": True,
+                    "use_shm": use_shm,
+                },
+            )
+        )
+
+        async def _send_to_rank(local_rank: int):
+            zmq_handle = (
+                f"ipc:///tmp/rl-colocate-zmq-replica-{self.replica_rank}"
+                f"-rank-{local_rank}.sock"
+            )
+            sender = BucketedWeightSender(
+                zmq_handle=zmq_handle,
+                bucket_size_mb=bucket_size_mb,
+                use_shm=use_shm,
+            )
+
+            async def _weights():
+                for name, tensor in lora_state_dict.items():
+                    yield name, tensor
+
+            await sender.async_send_weights(_weights())
+
+        try:
+            await asyncio.gather(
+                *(_send_to_rank(r) for r in range(num_local_workers))
+            )
+            await receive_task
+            return True
+        except Exception:
+            logger.exception("update_lora_adapter failed")
+            receive_task.cancel()
+            return False
+
+    async def remove_lora(self, lora_int_id: int) -> bool:
+        """Remove a loaded LoRA adapter from the running vLLM engine."""
+        if self.node_rank != 0:
+            return True
+        return await self.engine.remove_lora(lora_int_id)
+
+    async def list_loras(self) -> set[int]:
+        """List LoRA adapter ids currently loaded in the engine."""
+        if self.node_rank != 0:
+            return set()
+        return await self.engine.list_loras()
 
     async def sleep(self):
         if self.node_rank != 0 or not self.config.free_cache_engine:
@@ -933,6 +1112,17 @@ class vLLMReplica(RolloutReplica):
                         # https://docs.vllm.ai/en/latest/usage/troubleshooting.html?h=nccl_cumem_enable#known-issues
                         # https://github.com/vllm-project/vllm/blob/c6b0a7d3ba03ca414be1174e9bd86a97191b7090/vllm/worker/worker_base.py#L445
                         "NCCL_CUMEM_ENABLE": "0",
+                        # Propagate split-related env vars from driver to vLLM server actors.
+                        # VLLM_USE_V2_MODEL_RUNNER=0 is required for the current layer-wise split impl.
+                        **{k: v for k, v in os.environ.items() if k.startswith("VLLM_SPLIT_") or k == "VLLM_USE_V2_MODEL_RUNNER"},
+                        # NCCL network env vars may also be required for cross-node split.
+                        **{k: os.environ[k] for k in [
+                            "VLLM_HOST_IP",
+                            "NCCL_SOCKET_IFNAME",
+                            "NCCL_IB_DISABLE",
+                            "NCCL_NET",
+                            "NCCL_P2P_DISABLE",
+                        ] if k in os.environ},
                     }
                 },
                 name=name,
@@ -998,6 +1188,17 @@ class vLLMReplica(RolloutReplica):
     async def resume_generation(self):
         """Resume generation on all servers after abort_all_requests."""
         await asyncio.gather(*[server.resume_generation.remote() for server in self.servers])
+
+    async def update_lora_adapter(
+        self,
+        lora_state_dict: dict[str, Any],
+        peft_config: dict,
+    ) -> bool:
+        """Push an in-memory LoRA adapter to every server in this replica."""
+        results = await asyncio.gather(
+            *[server.update_lora_adapter.remote(lora_state_dict, peft_config) for server in self.servers]
+        )
+        return all(results)
 
     async def abort_request(self, request_id: str) -> dict[str, Any]:
         """Abort a specific request. Tries all servers since we don't know which one has it.
