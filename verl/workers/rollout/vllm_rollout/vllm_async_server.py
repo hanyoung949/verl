@@ -1233,8 +1233,10 @@ class vLLMReplica(RolloutReplica):
                     "NCCL_CUMEM_ENABLE": "0",
                     "VLLM_RAY_BUNDLE_INDICES": bundle_indices,
                     **{k: v for k, v in os.environ.items() if k.startswith("VLLM_SPLIT_") or k == "VLLM_USE_V2_MODEL_RUNNER"},
+                    # Do NOT propagate VLLM_HOST_IP: split workers must bind
+                    # to their own node's IP.  NCCL_SOCKET_IFNAME is enough to
+                    # keep the control plane on the right interface.
                     **{k: os.environ[k] for k in [
-                        "VLLM_HOST_IP",
                         "NCCL_SOCKET_IFNAME",
                         "NCCL_IB_DISABLE",
                         "NCCL_NET",
