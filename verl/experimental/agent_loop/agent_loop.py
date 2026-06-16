@@ -1105,6 +1105,15 @@ class AgentLoopManager:
         )
         num_replicas = world_size // rollout_world_size
 
+        # For layer-wise split with an explicit stage-node map, one replica is
+        # spread non-uniformly across nodes, so do not create additional replicas
+        # based on the total node GPU count.
+        if (
+            getattr(self.rollout_config, "enable_layerwise_split", False)
+            and getattr(self.rollout_config, "split_stage_node_map", None) is not None
+        ):
+            num_replicas = 1
+
         self.rollout_replicas = [
             self.rollout_replica_class(
                 replica_rank=replica_rank,
