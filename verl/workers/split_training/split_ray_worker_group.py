@@ -22,7 +22,7 @@ from typing import Any, Optional
 
 import ray
 import torch
-from ray.util.placement_group import placement_group
+from ray.util.placement_group import placement_group, remove_placement_group
 from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 from transformers import AutoConfig, AutoModelForCausalLM
 
@@ -71,9 +71,9 @@ class SplitRayWorkerGroup:
 
         # One placement group with 3 GPU bundles, packed onto the same node.
         bundles = [{"CPU": 4, "GPU": 1} for _ in range(num_gpus)]
-        if node_ip is not None:
+        if self.node_ip is not None:
             for b in bundles:
-                b[f"node:{node_ip}"] = 0.001
+                b[f"node:{self.node_ip}"] = 0.001
         self.pg = placement_group(
             bundles=bundles,
             strategy="STRICT_PACK",
@@ -220,5 +220,15 @@ class SplitRayWorkerGroup:
         return local_path
 
     def shutdown(self):
+        # Shutdown actors, kill them, and release the placement group so GPUs
+        # are not held after training finishes (important when rollout reuses
+        # the same Ray cluster with non-uniform resource pools).
         refs = [a.shutdown.remote() for a in self.actors]
-        return ray.get(refs)
+        result = ray.get(refs)
+        for a in self.actors:
+            ray.kill(a)
+        self.actors = []
+        if self.pg is not None:
+            remove_placement_group(self.pg)
+            self.pg = None
+        return result
