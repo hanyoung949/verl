@@ -22,7 +22,8 @@ import ray
 from omegaconf import DictConfig
 from pydantic import BaseModel, ConfigDict
 from ray.actor import ActorHandle
-from ray.util.placement_group import PlacementGroup, PlacementGroupSchedulingStrategy, placement_group
+from ray.util.placement_group import PlacementGroup, placement_group
+from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 
 from verl.single_controller.ray import RayClassWithInitArgs, RayResourcePool, RayWorkerGroup, ResourcePoolManager
 from verl.utils.config import omega_conf_to_dataclass
