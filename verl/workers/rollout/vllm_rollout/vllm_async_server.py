@@ -101,6 +101,7 @@ class vLLMHttpServer:
         gpus_per_node: int,
         nnodes: int,
         cuda_visible_devices: str,
+        placement_group: Any = None,
     ):
         """
         Args:
@@ -127,8 +128,17 @@ class vLLMHttpServer:
         self.node_rank = node_rank
         self.gpus_per_node = gpus_per_node
         self.nnodes = nnodes
+        self.placement_group = placement_group
         # model weights version, set by ServerAdapter when update weights.
         self.global_steps = None
+
+        if self.placement_group is not None:
+            world_size = (
+                self.config.tensor_model_parallel_size
+                * self.config.pipeline_model_parallel_size
+                * self.config.data_parallel_size
+            )
+            os.environ["VLLM_RAY_BUNDLE_INDICES"] = ",".join(str(i) for i in range(world_size))
 
         if self.rollout_mode != RolloutMode.HYBRID and self.config.load_format == "dummy":
             logger.warning(f"rollout mode is {self.rollout_mode}, load_format is dummy, set to auto")
@@ -397,6 +407,8 @@ class vLLMHttpServer:
         engine_args = AsyncEngineArgs.from_cli_args(args)
         usage_context = UsageContext.OPENAI_API_SERVER
         vllm_config = engine_args.create_engine_config(usage_context=usage_context)
+        if self.placement_group is not None:
+            vllm_config.parallel_config.placement_group = self.placement_group
         vllm_config.parallel_config.data_parallel_master_port = self._dp_master_port
 
         fn_args = set(dict(inspect.signature(AsyncLLM.from_vllm_config).parameters).keys())
@@ -1068,6 +1080,10 @@ class vLLMReplica(RolloutReplica):
 
         self._validate_launch_requirements()
 
+        if self._is_split_with_map:
+            await self._launch_split_servers()
+            return
+
         # get (node_id, CUDA_VISIBLE_DEVICES) of all workers
         worker_infos = await asyncio.gather(
             *[
@@ -1154,6 +1170,89 @@ class vLLMReplica(RolloutReplica):
         # get http server address from first server
         server_address, server_port = await self.servers[0].get_server_address.remote()
         self._server_handle = self.servers[0]
+        self._server_address = (
+            f"[{server_address}]:{server_port}"
+            if is_valid_ipv6_address(server_address)
+            else f"{server_address}:{server_port}"
+        )
+
+    async def _launch_split_servers(self):
+        """Launch a single vLLM frontend for cross-node layer-wise split.
+
+        The engine workers are managed by vLLM's RayExecutorV2 inside the shared
+        cross-node placement group created by ``RolloutReplica.init_standalone``.
+        Only the master node (where rank 0 / stage_0 is placed) runs the HTTP
+        frontend; remote stages are pure Ray worker actors.
+        """
+        from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
+
+        worker_infos = self._split_worker_infos
+        pg = self._split_placement_group
+
+        master_node_id = worker_infos[0][0]
+        master_gpu_ids = [info[1] for info in worker_infos]
+        # Master node may hold multiple ranks (stage_0 and stage_2 for TP=1).
+        # The vLLMHttpServer actor itself does not use local GPUs, but we keep
+        # the visible-devices string consistent with the legacy path.
+        master_cuda_visible_devices = ",".join(
+            info[1] for info in worker_infos if info[0] == master_node_id
+        )
+
+        logger.info(
+            "Launching cross-node split vLLM server on master node %s with CUDA_VISIBLE_DEVICES=%s",
+            master_node_id,
+            master_cuda_visible_devices,
+        )
+
+        prefix = self._get_server_name_prefix()
+        if self.is_reward_model:
+            name = f"{prefix}server_reward_{self.replica_rank}_0{self.name_suffix}"
+        elif self.is_teacher_model:
+            name = f"{prefix}server_teacher_{self.replica_rank}_0{self.name_suffix}"
+        else:
+            name = f"{prefix}server_{self.replica_rank}_0{self.name_suffix}"
+
+        bundle_indices = ",".join(str(i) for i in range(self.world_size))
+        server = self.server_class.options(
+            scheduling_strategy=NodeAffinitySchedulingStrategy(
+                node_id=master_node_id,
+                soft=False,
+            ),
+            runtime_env={
+                "env_vars": {
+                    "RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES": "1",
+                    "RAY_EXPERIMENTAL_NOSET_ASCEND_RT_VISIBLE_DEVICES": "1",
+                    "NCCL_CUMEM_ENABLE": "0",
+                    "VLLM_RAY_BUNDLE_INDICES": bundle_indices,
+                    **{k: v for k, v in os.environ.items() if k.startswith("VLLM_SPLIT_") or k == "VLLM_USE_V2_MODEL_RUNNER"},
+                    **{k: os.environ[k] for k in [
+                        "VLLM_HOST_IP",
+                        "NCCL_SOCKET_IFNAME",
+                        "NCCL_IB_DISABLE",
+                        "NCCL_NET",
+                        "NCCL_P2P_DISABLE",
+                    ] if k in os.environ},
+                }
+            },
+            name=name,
+            max_concurrency=self.max_concurrency,
+        ).remote(
+            config=self.config,
+            model_config=self.model_config,
+            rollout_mode=self.rollout_mode,
+            workers=[None] * self.world_size,
+            replica_rank=self.replica_rank,
+            node_rank=0,
+            gpus_per_node=len(master_gpu_ids),
+            nnodes=self.nnodes,
+            cuda_visible_devices=master_cuda_visible_devices,
+            placement_group=pg,
+        )
+        self.servers.append(server)
+
+        await server.launch_server.remote()
+        server_address, server_port = await server.get_server_address.remote()
+        self._server_handle = server
         self._server_address = (
             f"[{server_address}]:{server_port}"
             if is_valid_ipv6_address(server_address)

@@ -22,6 +22,7 @@ import ray
 from omegaconf import DictConfig
 from pydantic import BaseModel, ConfigDict
 from ray.actor import ActorHandle
+from ray.util.placement_group import PlacementGroup, PlacementGroupSchedulingStrategy, placement_group
 
 from verl.single_controller.ray import RayClassWithInitArgs, RayResourcePool, RayWorkerGroup, ResourcePoolManager
 from verl.utils.config import omega_conf_to_dataclass
@@ -78,6 +79,45 @@ def _get_split_process_on_nodes(
     sorted_ips = sorted(ip_to_gpus.keys())
     process_on_nodes = [ip_to_gpus[ip] for ip in sorted_ips]
     return process_on_nodes, sorted_ips
+
+
+def _get_split_stage_ips_in_rank_order(
+    stage_node_map: str,
+    split_stage_1_tensor_parallel_size: int,
+) -> list[str]:
+    """Return the target node IP for each split rank in rank order.
+
+    Rank layout: stage_0 (rank 0), stage_1 (ranks 1..tp_size), stage_2 (last).
+    """
+    stage_map = _parse_split_stage_node_map(stage_node_map)
+    return (
+        [stage_map["stage_0"]]
+        + [stage_map["stage_1"]] * split_stage_1_tensor_parallel_size
+        + [stage_map["stage_2"]]
+    )
+
+
+@ray.remote
+class _SplitPlacementWorker:
+    """Lightweight placeholder actor used only to discover its PG bundle placement."""
+
+    def get_node_and_gpu(self) -> tuple[str, str]:
+        import ray
+        node_id = ray.get_runtime_context().get_node_id()
+        gpu_ids = ray.get_runtime_context().get_accelerator_ids().get("GPU", [])
+        gpu_id = gpu_ids[0] if gpu_ids else ""
+        return node_id, gpu_id
+
+
+class _SplitResourcePool:
+    """Minimal resource-pool wrapper for the custom cross-node split placement group."""
+
+    def __init__(self, pg: PlacementGroup, store: list[int], max_colocate_count: int, use_gpu: bool, name_prefix: str):
+        self.pgs = [pg]
+        self.store = store
+        self.max_colocate_count = max_colocate_count
+        self.use_gpu = use_gpu
+        self.name_prefix = name_prefix
 
 
 # Max number of concurrent calls to the methods of Rollout,
@@ -174,11 +214,31 @@ class RolloutReplica(ABC):
             * self.config.pipeline_model_parallel_size
         )
         self.gpus_per_node = gpus_per_node
-        self.gpus_per_replica_node = min(gpus_per_node, self.world_size)
-        assert self.world_size % self.gpus_per_replica_node == 0, (
-            f"world_size {self.world_size} must be divisible by gpus_per_node {self.gpus_per_replica_node}"
+
+        # Non-uniform layer-wise split topology is not described by a uniform
+        # (gpus_per_node, nnodes) grid.  Compute the per-node GPU counts and
+        # node IPs directly from the stage-node map when it is present.
+        self._is_split_with_map = (
+            getattr(self.config, "enable_layerwise_split", False)
+            and getattr(self.config, "split_stage_node_map", None) is not None
         )
-        self.nnodes = self.world_size // self.gpus_per_replica_node
+        if self._is_split_with_map:
+            self._split_process_on_nodes, self._split_node_ips = _get_split_process_on_nodes(
+                self.config.split_stage_node_map,
+                getattr(self.config, "split_stage_1_tensor_parallel_size", 1),
+            )
+            self.nnodes = len(self._split_node_ips)
+            # This is only used as a fallback for legacy slicing; the actual
+            # per-node GPU counts come from ``_split_process_on_nodes``.
+            self.gpus_per_replica_node = max(self._split_process_on_nodes) if self._split_process_on_nodes else 1
+        else:
+            self._split_process_on_nodes = None
+            self._split_node_ips = None
+            self.gpus_per_replica_node = min(gpus_per_node, self.world_size)
+            assert self.world_size % self.gpus_per_replica_node == 0, (
+                f"world_size {self.world_size} must be divisible by gpus_per_node {self.gpus_per_replica_node}"
+            )
+            self.nnodes = self.world_size // self.gpus_per_replica_node
         self.is_reward_model = is_reward_model
         self.is_teacher_model = is_teacher_model
         self.name_suffix = f"_{name_suffix}" if name_suffix else ""
@@ -191,6 +251,60 @@ class RolloutReplica(ABC):
         self.servers: list[ActorHandle] = []
         self._server_address: str = None
         self._server_handle: ActorHandle = None
+
+    def _build_split_placement_group(self) -> tuple[PlacementGroup, list[tuple[str, str]]]:
+        """Build a single cross-node placement group for layer-wise split.
+
+        Bundles are ordered by split rank (stage_0, stage_1, stage_2) and pinned
+        to the nodes specified in ``split_stage_node_map``.  Short-lived
+        placeholder actors are scheduled into the bundles to discover the
+        actual node/GPU assignments, then killed so vLLM can reuse the bundles.
+        """
+        stage_node_map = self.config.split_stage_node_map
+        stage_1_tp = getattr(self.config, "split_stage_1_tensor_parallel_size", 1)
+        rank_ips = _get_split_stage_ips_in_rank_order(stage_node_map, stage_1_tp)
+
+        node_ip_to_id = {
+            n["NodeManagerAddress"]: n["NodeID"]
+            for n in ray.nodes()
+            if n["Alive"]
+        }
+
+        bundles: list[dict[str, Any]] = []
+        for ip in rank_ips:
+            node_id = node_ip_to_id.get(ip)
+            if node_id is None:
+                raise RuntimeError(f"Node with IP {ip} from split_stage_node_map is not alive in Ray cluster")
+            bundle = {"CPU": 4, "GPU": 1, f"node:{ip}": 0.001}
+            bundles.append(bundle)
+
+        pg = placement_group(bundles=bundles, strategy="PACK", name=f"split_rollout_pg_{self.replica_rank}")
+        ray.get(pg.ready())
+
+        # Discover node/GPU placement using lightweight actors.
+        placeholder_refs = []
+        for i in range(self.world_size):
+            actor = _SplitPlacementWorker.options(
+                num_gpus=1,
+                scheduling_strategy=PlacementGroupSchedulingStrategy(
+                    placement_group=pg,
+                    placement_group_bundle_index=i,
+                ),
+            ).remote()
+            placeholder_refs.append(actor)
+
+        worker_infos = ray.get([a.get_node_and_gpu.remote() for a in placeholder_refs])
+        for a in placeholder_refs:
+            ray.kill(a)
+
+        logger.info(
+            "Created cross-node split placement group with bundles: %s",
+            [
+                {"rank": i, "node_ip": rank_ips[i], "node_id": worker_infos[i][0], "gpu": worker_infos[i][1]}
+                for i in range(self.world_size)
+            ],
+        )
+        return pg, worker_infos
 
     async def init_hybrid(self, worker_group: RayWorkerGroup):
         """Init hybrid rollout server, rollout engine and training engine(fsdp/megatron) fused in same process.
@@ -261,32 +375,25 @@ class RolloutReplica(ABC):
         else:
             resource_pool_name = f"rollout_pool_{self.replica_rank}{self.name_suffix}"
 
-        # For layer-wise split with an explicit stage-node map, use a non-uniform
-        # resource pool so each node reserves exactly the GPUs needed for the
-        # stages pinned to it. Otherwise fall back to the legacy uniform pool.
-        is_split_with_map = (
-            getattr(self.config, "enable_layerwise_split", False)
-            and getattr(self.config, "split_stage_node_map", None) is not None
-        )
-        if is_split_with_map:
-            process_on_nodes, node_ips = _get_split_process_on_nodes(
-                self.config.split_stage_node_map,
-                getattr(self.config, "split_stage_1_tensor_parallel_size", 1),
+        # For layer-wise split with an explicit stage-node map, create a single
+        # cross-node placement group with bundles ordered by split rank (stage_0,
+        # stage_1, stage_2) and with per-bundle node affinity.  A set of
+        # short-lived placeholder actors is used to discover node/GPU assignments,
+        # then killed so the vLLM RayExecutorV2 can schedule its own workers into
+        # the same bundles.  For all other topologies, fall back to the legacy
+        # uniform resource pool.
+        if self._is_split_with_map:
+            self._split_placement_group, self._split_worker_infos = (
+                self._build_split_placement_group()
             )
-            logger.info(
-                "Creating non-uniform standalone resource pool for split rollout: "
-                "process_on_nodes=%s, node_ips=%s",
-                process_on_nodes,
-                node_ips,
-            )
-            self.resource_pool = RayResourcePool(
-                process_on_nodes=process_on_nodes,
-                node_ips=node_ips,
-                use_gpu=True,
+            self.workers = [None] * self.world_size
+            self.resource_pool = _SplitResourcePool(
+                pg=self._split_placement_group,
+                store=[self.world_size],
                 max_colocate_count=3,
+                use_gpu=True,
                 name_prefix=resource_pool_name,
             )
-            self.resource_pool.get_placement_groups(device_name="cuda" if not is_torch_npu_available(check_device=False) else "npu")
         else:
             resource_pool_spec = {
                 resource_pool_name: [self.gpus_per_replica_node] * self.nnodes,
@@ -295,23 +402,23 @@ class RolloutReplica(ABC):
             resource_pool_manager.create_resource_pool()
             self.resource_pool = resource_pool_manager.resource_pool_dict[resource_pool_name]
 
-        # create worker group for this rollout
-        use_gpu = self.rollout_worker_use_gpu()
-        if self.is_reward_model:
-            name_prefix = f"rollout_reward_standalone_{self.replica_rank}{self.name_suffix}"
-        elif self.is_teacher_model:
-            name_prefix = f"rollout_teacher_standalone_{self.replica_rank}{self.name_suffix}"
-        else:
-            name_prefix = f"rollout_standalone_{self.replica_rank}{self.name_suffix}"
-        worker_group = RayWorkerGroup(
-            resource_pool=self.resource_pool,
-            ray_cls_with_init=self.get_ray_class_with_init_args(),
-            bin_pack=False,
-            name_prefix=name_prefix,
-            use_gpu=use_gpu,
-            device_name="cuda" if not is_torch_npu_available(check_device=False) else "npu",
-        )
-        self.workers = worker_group.workers
+            # create worker group for this rollout
+            use_gpu = self.rollout_worker_use_gpu()
+            if self.is_reward_model:
+                name_prefix = f"rollout_reward_standalone_{self.replica_rank}{self.name_suffix}"
+            elif self.is_teacher_model:
+                name_prefix = f"rollout_teacher_standalone_{self.replica_rank}{self.name_suffix}"
+            else:
+                name_prefix = f"rollout_standalone_{self.replica_rank}{self.name_suffix}"
+            worker_group = RayWorkerGroup(
+                resource_pool=self.resource_pool,
+                ray_cls_with_init=self.get_ray_class_with_init_args(),
+                bin_pack=False,
+                name_prefix=name_prefix,
+                use_gpu=use_gpu,
+                device_name="cuda" if not is_torch_npu_available(check_device=False) else "npu",
+            )
+            self.workers = worker_group.workers
         await self.launch_servers()
 
     def get_ray_class_with_init_args(self) -> RayClassWithInitArgs:
