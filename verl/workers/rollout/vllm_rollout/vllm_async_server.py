@@ -343,7 +343,15 @@ class vLLMHttpServer:
         args.update({"enable_expert_parallel": self.config.expert_parallel_size > 1})
 
         # used for torch.distributed.init_process_group
-        if self.nnodes > 1:
+        # Layer-wise split with a non-uniform stage-node map is orchestrated by
+        # vLLM's RayExecutorV2 using the externally supplied placement group, so
+        # do not pass the uniform multi-node args that assume nnodes divides
+        # world_size.
+        is_split_with_map = (
+            getattr(self.config, "enable_layerwise_split", False)
+            and getattr(self.config, "split_stage_node_map", None) is not None
+        )
+        if self.nnodes > 1 and not is_split_with_map:
             args.update(
                 {
                     "master_addr": self._master_address,
