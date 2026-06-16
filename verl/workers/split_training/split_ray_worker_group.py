@@ -229,6 +229,16 @@ class SplitRayWorkerGroup:
             ray.kill(a)
         self.actors = []
         if self.pg is not None:
+            pg_id = self.pg.id
             remove_placement_group(self.pg)
+            # Wait until the placement group is actually removed so the next
+            # rollout placement group does not starve for GPUs.
+            for _ in range(120):
+                table = ray.util.placement_group_table()
+                state = table.get(pg_id, {}).get("state")
+                if state in ("REMOVED", None):
+                    break
+                import time
+                time.sleep(0.5)
             self.pg = None
         return result
