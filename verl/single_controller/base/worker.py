@@ -276,9 +276,13 @@ class Worker(WorkerHelper):
             # RAY_EXPERIMENTAL_NOSET_*_VISIBLE_DEVICES is set,
             # so we need to set local rank when the flag is set.
             device_name = "NPU" if is_npu_available else "GPU"
-            local_rank = ray.get_runtime_context().get_accelerator_ids()[device_name][0]
-            os.environ["LOCAL_RANK"] = local_rank
-            get_torch_device().set_device(int(local_rank))
+            accelerator_ids = ray.get_runtime_context().get_accelerator_ids()
+            device_ids = accelerator_ids.get(device_name, [])
+            if device_ids:
+                local_rank = device_ids[0]
+                os.environ["LOCAL_RANK"] = local_rank
+                get_torch_device().set_device(int(local_rank))
+            # else: num_gpus=0 — LOCAL_RANK should be pre-set in env vars.
 
     def _configure_with_store(self, store: dict):
         """
