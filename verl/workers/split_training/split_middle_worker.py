@@ -34,6 +34,9 @@ class SplitMiddleWorker(Worker):
     def __init__(self, config):
         Worker.__init__(self)
         initialize_global_process_group(timeout_second=300)
+        # Force NCCL communicator initialization for all ranks.
+        import torch.distributed as dist
+        dist.barrier()
 
         self.config = config
         # Build topology from config or use default 3-rank layout.
