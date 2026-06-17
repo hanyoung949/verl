@@ -117,6 +117,21 @@ class SplitStageWorker(Worker):
 
     def reset(self):
         """Re-initialize the engine (reload weights/optimizers)."""
+        # Force NCCL communicator setup between all rank pairs.
+        import torch.distributed as dist
+        world_size = dist.get_world_size()
+        rank = dist.get_rank()
+        dummy = torch.zeros(1, device="cuda")
+        for peer in range(world_size):
+            if peer == rank:
+                continue
+            if peer > rank:
+                dist.send(dummy, dst=peer)
+                dist.recv(dummy, src=peer)
+            else:
+                dist.recv(dummy, src=peer)
+                dist.send(dummy, dst=peer)
+        dist.barrier()
         self.engine.initialize()
         return {"rank": self._rank, "stage": "head" if self.is_head else "tail"}
 
