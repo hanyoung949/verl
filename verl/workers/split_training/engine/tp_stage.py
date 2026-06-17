@@ -22,6 +22,7 @@ import torch
 import torch.distributed as dist
 from torch import Tensor, nn
 import torch.nn.functional as F
+from transformers.models.llama.modeling_llama import apply_rotary_pos_emb, repeat_kv
 
 from .transport import FWD_ONLY, FWD_WITH_BWD, SHUTDOWN, PIPELINE_DONE, _DTYPE_MAP
 
@@ -66,7 +67,13 @@ class _TPAllReduce(torch.autograd.Function):
 
 
 class _TPAllReduceGrad(torch.autograd.Function):
-    """Identity in forward, all-reduce in backward."""
+    """Identity in forward, all-reduce in backward.
+
+    NOTE: currently unused — grad aggregation for column-parallel backward is
+    handled directly in TPMiddleStage._run_once_impl (master collects slave's
+    partial grad_input and sums).  Kept for future tp_size>2 support where
+    in-graph all-reduce may be cleaner than explicit send/recv.
+    """
 
     @staticmethod
     def forward(ctx, x, tp_rank, tp_size):
@@ -202,24 +209,17 @@ class TPQwen2Attention(nn.Module):
 
         if position_embeddings is not None:
             cos, sin = position_embeddings
-            q = self._apply_rotary(q, cos, sin)
-            k = self._apply_rotary(k, cos, sin)
+            q, k = apply_rotary_pos_emb(q, k, cos, sin)
 
-        if self.num_kv_heads_local < self.num_heads_local:
-            repeat_factor = self.num_heads_local // self.num_kv_heads_local
-            k = k.repeat_interleave(repeat_factor, dim=1)
-            v = v.repeat_interleave(repeat_factor, dim=1)
+        # GQA: repeat k/v heads to match q heads
+        num_kv_groups = self.num_heads_local // self.num_kv_heads_local
+        if num_kv_groups > 1:
+            k = repeat_kv(k, num_kv_groups)
+            v = repeat_kv(v, num_kv_groups)
 
         attn_out = F.scaled_dot_product_attention(q, k, v, attn_mask=attention_mask)
         attn_out = attn_out.transpose(1, 2).contiguous().view(bsz, seq_len, -1)
         return self.o_proj(attn_out)
-
-    @staticmethod
-    def _apply_rotary(x, cos, sin):
-        d = x.shape[-1]
-        x1, x2 = x[..., :d // 2], x[..., d // 2:]
-        rotated = torch.cat((-x2, x1), dim=-1)
-        return x * cos + rotated * sin
 
 
 class TPQwen2MLP(nn.Module):
