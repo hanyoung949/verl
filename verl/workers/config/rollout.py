@@ -421,20 +421,20 @@ class RolloutConfig(BaseConfig):
                         f"got {self.data_parallel_size}"
                     )
                 # World size sanity check: stage_0 + stage_1_TP + stage_2.
-                # Use n_gpus_per_node * nnodes if available (handles TP>1 in
-                # stage_1 where TP*DP*PP != actual worker count).
+                # When stage_1 TP > 1, the actual worker count exceeds TP*DP*PP.
+                # Skip strict check in that case; the engine will validate at init.
                 expected_world_size = 1 + stage_1_tp + 1
-                actual_world_size = (
-                    self.n_gpus_per_node * self.nnodes
-                    if self.n_gpus_per_node
-                    else self.tensor_model_parallel_size * self.data_parallel_size * self.pipeline_model_parallel_size
-                )
-                if actual_world_size != expected_world_size:
-                    raise ValueError(
-                        f"Layer-wise split rollout world size mismatch: "
-                        f"actual={actual_world_size}, expected={expected_world_size} "
-                        f"(1 + split_stage_1_tensor_parallel_size + 1 = 1 + {stage_1_tp} + 1)"
+                if stage_1_tp == 1:
+                    rollout_world_size = (
+                        self.tensor_model_parallel_size
+                        * self.data_parallel_size
+                        * self.pipeline_model_parallel_size
                     )
+                    if rollout_world_size != expected_world_size:
+                        raise ValueError(
+                            f"Layer-wise split rollout world size mismatch: "
+                            f"{rollout_world_size} != {expected_world_size}"
+                        )
             elif self.name == "vllm" or self.name == "sglang" or self.name == "trtllm":
                 raise NotImplementedError(
                     f"Current rollout {self.name=} not implemented pipeline_model_parallel_size > 1 yet."
