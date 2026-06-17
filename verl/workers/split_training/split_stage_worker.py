@@ -116,7 +116,12 @@ class SplitStageWorker(Worker):
         return self._lm_loss
 
     def reset(self):
-        """Re-initialize the engine (reload weights/optimizers)."""
+        """Re-initialize the engine (reload weights/optimizers).
+
+        IMPORTANT: all ranks must call reset() concurrently (e.g. via
+        ``ray.get([a.reset.remote() for a in actors])``).  The all-pairs
+        ping below is a collective — if called sequentially it will deadlock.
+        """
         import torch
         import torch.distributed as dist
         world_size = dist.get_world_size()

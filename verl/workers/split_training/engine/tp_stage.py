@@ -386,10 +386,17 @@ class TPMiddleStage:
                 # Forward grad to slave so both can backward
                 dist.send(grad_out.contiguous(), dst=peer)
                 torch.autograd.backward(h_out, grad_out)
-                self._send_tensor(h_in.grad, stage_0_rank)
+
+                # Collect slave's grad_input and merge (column-parallel backward
+                # produces partial gradients that must be summed across TP ranks).
+                slave_grad = self._recv_tensor(h_in.grad.shape, h_in.grad.dtype, peer)
+                full_grad = h_in.grad + slave_grad
+                self._send_tensor(full_grad, stage_0_rank)
             else:
                 grad_out = self._recv_tensor(h_out.shape, h_out.dtype, peer)
                 torch.autograd.backward(h_out, grad_out)
+                # Send partial grad_input to master for aggregation
+                dist.send(h_in.grad.contiguous(), dst=peer)
 
         return True
 
