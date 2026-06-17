@@ -34,14 +34,9 @@ class SplitStageWorker(Worker):
     def __init__(self, config):
         Worker.__init__(self)
         initialize_global_process_group(timeout_second=300)
-        # Force NCCL communicator initialization for all ranks.
-        import torch.distributed as dist
-        dist.barrier()
 
         self.config = config
-        # Build topology from config or use default 3-rank layout.
         stage_1_tp = getattr(config, 'stage_1_tp', 1)
-        self._stage_1_tp = stage_1_tp
         if stage_1_tp > 1:
             topology = {
                 "stage_0": [0],
@@ -122,12 +117,6 @@ class SplitStageWorker(Worker):
 
     def reset(self):
         """Re-initialize the engine (reload weights/optimizers)."""
-        # Create TP process group in reset() (collective: all ranks must participate).
-        if self._stage_1_tp > 1:
-            import torch.distributed as dist
-            dist.barrier()  # Synchronize before new_group
-            stage_1_ranks = list(range(1, 1 + self._stage_1_tp))
-            dist.new_group(ranks=stage_1_ranks)
         self.engine.initialize()
         return {"rank": self._rank, "stage": "head" if self.is_head else "tail"}
 

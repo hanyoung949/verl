@@ -4,6 +4,9 @@ Implements true TP (not pipeline-split) for stage_1 layers, matching vLLM's
 inference-side TP sharding so that WeightSyncManager can directly sync LoRA
 weights without repartitioning.
 
+Current limitation: only supports tp_size=2 via manual send/recv all-reduce.
+This avoids ``dist.new_group`` NCCL issues with mixed PP+TP topologies.
+
 TP sharding convention (same as vLLM/Megatron):
   - Column-parallel (q_proj, k_proj, v_proj, gate_proj, up_proj):
     Split along output dimension.  Each rank holds (out_dim/tp, in_dim).
@@ -23,55 +26,80 @@ import torch.nn.functional as F
 from .transport import FWD_ONLY, FWD_WITH_BWD, SHUTDOWN, PIPELINE_DONE, _DTYPE_MAP
 
 
-class _AllReduce(torch.autograd.Function):
-    """All-reduce in forward, identity in backward (gradient is already replicated)."""
+# ---------------------------------------------------------------------------
+# Manual 2-rank all-reduce (avoids dist.new_group NCCL issues)
+# ---------------------------------------------------------------------------
+
+def _tp_all_reduce(x: Tensor, tp_rank: int, tp_size: int) -> Tensor:
+    """Manual 2-rank all-reduce using send/recv.
+
+    Maps TP rank to global rank: TP ranks 0,1 → global ranks 1,2.
+    Rank 0 sends partial sum to rank 1; rank 1 sums and sends back.
+    """
+    assert tp_size == 2, "Only tp_size=2 is supported for manual all-reduce"
+    global_ranks = list(range(1, 1 + tp_size))
+    peer = global_ranks[1 - tp_rank]
+
+    if tp_rank == 0:
+        dist.send(x.contiguous(), dst=peer)
+        dist.recv(x, src=peer)
+    else:
+        buf = torch.empty_like(x)
+        dist.recv(buf, src=peer)
+        x = x + buf
+        dist.send(x.contiguous(), dst=peer)
+    return x
+
+
+class _TPAllReduce(torch.autograd.Function):
+    """All-reduce in forward, identity in backward."""
 
     @staticmethod
-    def forward(ctx, x, group):
-        ctx.group = group
-        dist.all_reduce(x, op=dist.ReduceOp.SUM, group=group)
+    def forward(ctx, x, tp_rank, tp_size):
+        ctx.tp_rank = tp_rank
+        ctx.tp_size = tp_size
+        return _tp_all_reduce(x, tp_rank, tp_size)
+
+    @staticmethod
+    def backward(ctx, grad):
+        return grad, None, None
+
+
+class _TPAllReduceGrad(torch.autograd.Function):
+    """Identity in forward, all-reduce in backward."""
+
+    @staticmethod
+    def forward(ctx, x, tp_rank, tp_size):
+        ctx.tp_rank = tp_rank
+        ctx.tp_size = tp_size
         return x
 
     @staticmethod
     def backward(ctx, grad):
-        return grad, None
+        return _tp_all_reduce(grad, ctx.tp_rank, ctx.tp_size), None, None
 
 
-class _AllReduceGrad(torch.autograd.Function):
-    """Identity in forward, all-reduce in backward (for column-parallel gradient sync)."""
-
-    @staticmethod
-    def forward(ctx, x, group):
-        ctx.group = group
-        return x
-
-    @staticmethod
-    def backward(ctx, grad):
-        dist.all_reduce(grad, op=dist.ReduceOp.SUM, group=ctx.group)
-        return grad, None
-
+# ---------------------------------------------------------------------------
+# TP linear / LoRA primitives
+# ---------------------------------------------------------------------------
 
 class TPLinear(nn.Module):
-    """A linear layer sharded across TP ranks."""
+    """Linear layer sharded across TP ranks."""
 
-    def __init__(self, weight: Tensor, bias: Tensor | None, mode: str, tp_rank: int, tp_size: int, tp_group=None):
+    def __init__(self, weight: Tensor, bias: Tensor | None, mode: str, tp_rank: int, tp_size: int):
         super().__init__()
         self.mode = mode
         self.tp_rank = tp_rank
         self.tp_size = tp_size
-        self.tp_group = tp_group
 
         if mode == "column":
-            # Split along output dimension (dim 0 of weight matrix)
             chunks = weight.chunk(tp_size, dim=0)
             self.weight = nn.Parameter(chunks[tp_rank].contiguous())
             if bias is not None:
-                bias_chunks = bias.chunk(tp_size, dim=0)
-                self.bias = nn.Parameter(bias_chunks[tp_rank].contiguous())
+                self.bias = nn.Parameter(bias.chunk(tp_size, dim=0)[tp_rank].contiguous())
             else:
                 self.bias = None
         elif mode == "row":
-            # Split along input dimension (dim 1 of weight matrix)
             chunks = weight.chunk(tp_size, dim=1)
             self.weight = nn.Parameter(chunks[tp_rank].contiguous())
             self.bias = nn.Parameter(bias.contiguous()) if bias is not None else None
@@ -81,43 +109,48 @@ class TPLinear(nn.Module):
     def forward(self, x: Tensor) -> Tensor:
         out = F.linear(x, self.weight, self.bias if self.mode == "column" else None)
         if self.mode == "row":
-            out = _AllReduce.apply(out, self.tp_group)
+            out = _TPAllReduce.apply(out, self.tp_rank, self.tp_size)
             if self.bias is not None:
                 out = out + self.bias
         return out
 
 
 class TPLora(nn.Module):
-    """LoRA adapter sharded for TP."""
+    """LoRA adapter sharded for TP.
 
-    def __init__(self, lora_a: Tensor, lora_b: Tensor, mode: str, tp_rank: int, tp_size: int, scaling: float, tp_group=None):
+    Column-parallel (q_proj, v_proj): lora_A full, lora_B sharded on output dim.
+    Row-parallel (o_proj): lora_A sharded on input dim, lora_B full.
+    """
+
+    def __init__(self, lora_a: Tensor, lora_b: Tensor, mode: str, tp_rank: int, tp_size: int, scaling: float):
         super().__init__()
         self.scaling = scaling
         self.mode = mode
-        self.tp_group = tp_group
+        self.tp_rank = tp_rank
+        self.tp_size = tp_size
 
         if mode == "column":
-            # lora_A full, lora_B sharded along output dim
             self.lora_a = nn.Parameter(lora_a.contiguous())
-            chunks_b = lora_b.chunk(tp_size, dim=0)
-            self.lora_b = nn.Parameter(chunks_b[tp_rank].contiguous())
+            self.lora_b = nn.Parameter(lora_b.chunk(tp_size, dim=0)[tp_rank].contiguous())
         elif mode == "row":
-            # lora_A sharded along input dim, lora_B full
-            chunks_a = lora_a.chunk(tp_size, dim=0)
-            self.lora_a = nn.Parameter(chunks_a[tp_rank].contiguous())
+            self.lora_a = nn.Parameter(lora_a.chunk(tp_size, dim=0)[tp_rank].contiguous())
             self.lora_b = nn.Parameter(lora_b.contiguous())
 
     def forward(self, x: Tensor) -> Tensor:
         out = F.linear(F.linear(x, self.lora_a), self.lora_b) * self.scaling
         if self.mode == "row":
-            out = _AllReduce.apply(out, self.tp_group)
+            out = _TPAllReduce.apply(out, self.tp_rank, self.tp_size)
         return out
 
+
+# ---------------------------------------------------------------------------
+# Qwen2 TP layers
+# ---------------------------------------------------------------------------
 
 class TPQwen2Attention(nn.Module):
     """TP-aware Qwen2 self-attention with optional LoRA."""
 
-    def __init__(self, orig_attn, tp_rank: int, tp_size: int, tp_group=None):
+    def __init__(self, orig_attn, tp_rank: int, tp_size: int):
         super().__init__()
         config = orig_attn.config
         self.num_heads = config.num_attention_heads
@@ -125,23 +158,19 @@ class TPQwen2Attention(nn.Module):
         self.head_dim = orig_attn.head_dim
         self.hidden_size = config.hidden_size
 
-        # TP shard q/k/v/o projections
-        self.q_proj = TPLinear(orig_attn.q_proj.weight.data, getattr(orig_attn.q_proj, 'bias', None), "column", tp_rank, tp_size, tp_group)
-        self.k_proj = TPLinear(orig_attn.k_proj.weight.data, getattr(orig_attn.k_proj, 'bias', None), "column", tp_rank, tp_size, tp_group)
-        self.v_proj = TPLinear(orig_attn.v_proj.weight.data, getattr(orig_attn.v_proj, 'bias', None), "column", tp_rank, tp_size, tp_group)
-        self.o_proj = TPLinear(orig_attn.o_proj.weight.data, getattr(orig_attn.o_proj, 'bias', None), "row", tp_rank, tp_size, tp_group)
+        self.q_proj = TPLinear(orig_attn.q_proj.weight.data, getattr(orig_attn.q_proj, 'bias', None), "column", tp_rank, tp_size)
+        self.k_proj = TPLinear(orig_attn.k_proj.weight.data, getattr(orig_attn.k_proj, 'bias', None), "column", tp_rank, tp_size)
+        self.v_proj = TPLinear(orig_attn.v_proj.weight.data, getattr(orig_attn.v_proj, 'bias', None), "column", tp_rank, tp_size)
+        self.o_proj = TPLinear(orig_attn.o_proj.weight.data, getattr(orig_attn.o_proj, 'bias', None), "row", tp_rank, tp_size)
 
-        # LoRA for q_proj and v_proj (column-parallel)
-        self.q_lora = self._make_lora(orig_attn.q_proj, "column", tp_rank, tp_size, tp_group)
-        self.v_lora = self._make_lora(orig_attn.v_proj, "column", tp_rank, tp_size, tp_group)
+        self.q_lora = self._make_lora(orig_attn.q_proj, "column", tp_rank, tp_size)
+        self.v_lora = self._make_lora(orig_attn.v_proj, "column", tp_rank, tp_size)
 
-        # Per-TP-rank head counts
         self.num_heads_local = self.num_heads // tp_size
         self.num_kv_heads_local = self.num_key_value_heads // tp_size
 
     @staticmethod
-    def _make_lora(orig_proj, mode, tp_rank, tp_size, tp_group=None):
-        """Extract LoRA weights from a PEFT-wrapped linear and create TPLora."""
+    def _make_lora(orig_proj, mode, tp_rank, tp_size):
         lora_a = getattr(orig_proj, 'lora_A', None)
         lora_b = getattr(orig_proj, 'lora_B', None)
         if lora_a is None or lora_b is None:
@@ -151,7 +180,7 @@ class TPQwen2Attention(nn.Module):
         scaling = getattr(orig_proj, 'scaling', {}).get('default', 1.0)
         if hasattr(orig_proj, 'scaling') and isinstance(orig_proj.scaling, (int, float)):
             scaling = orig_proj.scaling
-        return TPLora(a_weight, b_weight, mode, tp_rank, tp_size, scaling, tp_group)
+        return TPLora(a_weight, b_weight, mode, tp_rank, tp_size, scaling)
 
     def forward(self, hidden_states, position_embeddings=None, attention_mask=None, **kwargs):
         bsz, seq_len, _ = hidden_states.shape
@@ -160,43 +189,33 @@ class TPQwen2Attention(nn.Module):
         k = self.k_proj(hidden_states)
         v = self.v_proj(hidden_states)
 
-        # Apply LoRA (column-parallel: no all-reduce needed)
         if self.q_lora is not None:
             q = q + self.q_lora(hidden_states)
         if self.v_lora is not None:
             v = v + self.v_lora(hidden_states)
 
-        # Reshape to (bsz, num_heads_local, seq_len, head_dim)
         q = q.view(bsz, seq_len, self.num_heads_local, self.head_dim).transpose(1, 2)
         k = k.view(bsz, seq_len, self.num_kv_heads_local, self.head_dim).transpose(1, 2)
         v = v.view(bsz, seq_len, self.num_kv_heads_local, self.head_dim).transpose(1, 2)
 
-        # Apply RoPE if position embeddings provided
         if position_embeddings is not None:
             cos, sin = position_embeddings
-            # Apply rotary embedding (simplified — assumes standard RoPE)
             q = self._apply_rotary(q, cos, sin)
             k = self._apply_rotary(k, cos, sin)
 
-        # GQA: repeat k/v heads if needed
         if self.num_kv_heads_local < self.num_heads_local:
             repeat_factor = self.num_heads_local // self.num_kv_heads_local
             k = k.repeat_interleave(repeat_factor, dim=1)
             v = v.repeat_interleave(repeat_factor, dim=1)
 
-        # Scaled dot-product attention
         attn_out = F.scaled_dot_product_attention(q, k, v, attn_mask=attention_mask)
-
-        # Reshape back
         attn_out = attn_out.transpose(1, 2).contiguous().view(bsz, seq_len, -1)
         return self.o_proj(attn_out)
 
     @staticmethod
     def _apply_rotary(x, cos, sin):
-        """Apply rotary position embedding."""
-        # cos/sin shape: (1, 1, seq_len, head_dim) or (bsz, 1, seq_len, head_dim)
         d = x.shape[-1]
-        x1, x2 = x[..., :d//2], x[..., d//2:]
+        x1, x2 = x[..., :d // 2], x[..., d // 2:]
         rotated = torch.cat((-x2, x1), dim=-1)
         return x * cos + rotated * sin
 
@@ -204,11 +223,11 @@ class TPQwen2Attention(nn.Module):
 class TPQwen2MLP(nn.Module):
     """TP-aware Qwen2 MLP (SwiGLU)."""
 
-    def __init__(self, orig_mlp, tp_rank: int, tp_size: int, tp_group=None):
+    def __init__(self, orig_mlp, tp_rank: int, tp_size: int):
         super().__init__()
-        self.gate_proj = TPLinear(orig_mlp.gate_proj.weight.data, None, "column", tp_rank, tp_size, tp_group)
-        self.up_proj = TPLinear(orig_mlp.up_proj.weight.data, None, "column", tp_rank, tp_size, tp_group)
-        self.down_proj = TPLinear(orig_mlp.down_proj.weight.data, None, "row", tp_rank, tp_size, tp_group)
+        self.gate_proj = TPLinear(orig_mlp.gate_proj.weight.data, None, "column", tp_rank, tp_size)
+        self.up_proj = TPLinear(orig_mlp.up_proj.weight.data, None, "column", tp_rank, tp_size)
+        self.down_proj = TPLinear(orig_mlp.down_proj.weight.data, None, "row", tp_rank, tp_size)
 
     def forward(self, x):
         return self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x))
@@ -217,53 +236,49 @@ class TPQwen2MLP(nn.Module):
 class TPQwen2DecoderLayer(nn.Module):
     """A single Qwen2 decoder layer with TP."""
 
-    def __init__(self, orig_layer, tp_rank: int, tp_size: int, tp_group=None):
+    def __init__(self, orig_layer, tp_rank: int, tp_size: int):
         super().__init__()
-        self.self_attn = TPQwen2Attention(orig_layer.self_attn, tp_rank, tp_size, tp_group)
-        self.mlp = TPQwen2MLP(orig_layer.mlp, tp_rank, tp_size, tp_group)
+        self.self_attn = TPQwen2Attention(orig_layer.self_attn, tp_rank, tp_size)
+        self.mlp = TPQwen2MLP(orig_layer.mlp, tp_rank, tp_size)
         self.input_layernorm = orig_layer.input_layernorm
         self.post_attention_layernorm = orig_layer.post_attention_layernorm
 
     def forward(self, hidden_states, position_embeddings=None, attention_mask=None, **kwargs):
-        # Pre-norm + attention + residual
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
-        attn_out = self.self_attn(hidden_states, position_embeddings=position_embeddings, attention_mask=attention_mask)
-        hidden_states = residual + attn_out
+        hidden_states = residual + self.self_attn(hidden_states, position_embeddings=position_embeddings, attention_mask=attention_mask)
 
-        # Pre-norm + MLP + residual
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
-        mlp_out = self.mlp(hidden_states)
-        hidden_states = residual + mlp_out
-
+        hidden_states = residual + self.mlp(hidden_states)
         return hidden_states
 
 
+# ---------------------------------------------------------------------------
+# TPMiddleStage — drop-in replacement for Stage1
+# ---------------------------------------------------------------------------
+
 class TPMiddleStage:
-    """Stage_1 with true Tensor Parallelism.
+    """Stage_1 with true Tensor Parallelism (tp_size=2 only).
 
     Each TP rank holds a shard of every layer's weights.  Forward/backward
-    uses all-reduce for row-parallel layers.  This matches vLLM's inference
-    TP so LoRA weights can be synced directly.
+    uses manual send/recv all-reduce for row-parallel layers.  Matches vLLM's
+    inference TP so LoRA weights sync directly.
     """
 
-    def __init__(self, layers, rotary_emb, device, tp_rank: int, tp_size: int, tp_group=None):
+    def __init__(self, layers, rotary_emb, device, tp_rank: int, tp_size: int):
         self.device = torch.device(device)
         self.tp_rank = tp_rank
         self.tp_size = tp_size
         self.rotary_emb = rotary_emb
-        self.tp_group = tp_group
 
-        # Build TP layers from original layers
         self.layers = nn.ModuleList([
-            TPQwen2DecoderLayer(layer, tp_rank, tp_size, tp_group) for layer in layers
+            TPQwen2DecoderLayer(layer, tp_rank, tp_size) for layer in layers
         ])
         self.layers.to(self.device)
         if self.rotary_emb is not None:
             self.rotary_emb = self.rotary_emb.to(self.device)
 
-        # Freeze all parameters
         for p in self.layers.parameters():
             p.requires_grad = False
 
@@ -313,10 +328,7 @@ class TPMiddleStage:
         tensor_dtype = _DTYPE_MAP[dtype_code]
         h = self._recv_tensor((B, S, H), tensor_dtype, recv_rank)
         pos_ids = self._recv_tensor((B, S), torch.int64, recv_rank)
-        if has_mask:
-            mask = self._recv_tensor((B, 1, S, S), tensor_dtype, recv_rank)
-        else:
-            mask = None
+        mask = self._recv_tensor((B, 1, S, S), tensor_dtype, recv_rank) if has_mask else None
 
         if flag == FWD_ONLY:
             with torch.no_grad():
