@@ -33,6 +33,7 @@ from verl.utils.torch_functional import logprobs_from_logits
 
 from ..split_utils import compute_split_layer_ranges
 from .middle_stage import Stage1
+from .tp_stage import TPMiddleStage
 from .stage import Stage0, Stage2
 from .transport import StageTransport, FWD_ONLY, FWD_WITH_BWD, SHUTDOWN, PIPELINE_DONE
 
@@ -165,26 +166,24 @@ class SplitTrainingEngine(BaseEngine):
             stage_1_layers_all = layers[self.stage_0_end : self.stage_1_end]
             n_stage1 = len(self.topology.get("stage_1", [1]))
             if n_stage1 > 1:
-                # Multi-rank stage_1: split layers across ranks.
+                # True TP: each rank holds a shard of EVERY layer.
                 rank_in_stage1 = self.topology["stage_1"].index(self.rank)
-                per_rank = len(stage_1_layers_all) // n_stage1
-                start = rank_in_stage1 * per_rank
-                end = start + per_rank if rank_in_stage1 < n_stage1 - 1 else len(stage_1_layers_all)
-                my_layers = stage_1_layers_all[start:end]
-                src = self.stage_0_rank if rank_in_stage1 == 0 else self.topology["stage_1"][rank_in_stage1 - 1]
-                dst = self.stage_2_rank if rank_in_stage1 == n_stage1 - 1 else self.topology["stage_1"][rank_in_stage1 + 1]
+                self.stage = TPMiddleStage(
+                    [l.to("cuda") for l in stage_1_layers_all],
+                    rotary_emb.to("cuda") if rotary_emb is not None else None,
+                    "cuda",
+                    tp_rank=rank_in_stage1,
+                    tp_size=n_stage1,
+                )
+                print(f"[rank{self.rank}] TPMiddleStage: {len(self.stage.layers)} layers, "
+                      f"tp_rank={rank_in_stage1}/{n_stage1}", flush=True)
             else:
-                my_layers = stage_1_layers_all
-                src = None  # will use topology default
-                dst = None
-            self.stage = Stage1(
-                [l.to("cuda") for l in my_layers],
-                rotary_emb.to("cuda") if rotary_emb is not None else None,
-                "cuda",
-                src_rank=src,
-                dst_rank=dst,
-            )
-            print(f"[rank{self.rank}] Stage1: {len(self.stage.layers)} layers (of {len(stage_1_layers_all)} total)", flush=True)
+                self.stage = Stage1(
+                    [l.to("cuda") for l in stage_1_layers_all],
+                    rotary_emb.to("cuda") if rotary_emb is not None else None,
+                    "cuda",
+                )
+                print(f"[rank{self.rank}] Stage1: {len(self.stage.layers)} layers", flush=True)
 
         elif self.is_stage_2:
             stage_2_layers = [l.to("cuda") for l in layers[self.stage_1_end :]]
