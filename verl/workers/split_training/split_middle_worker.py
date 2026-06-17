@@ -44,8 +44,13 @@ class SplitMiddleWorker(Worker):
                 "stage_1": list(range(1, 1 + stage_1_tp)),
                 "stage_2": [1 + stage_1_tp],
             }
+            # Create TP process group (collective: all ranks must participate).
+            import torch.distributed as dist
+            stage_1_ranks = list(range(1, 1 + stage_1_tp))
+            self._tp_group = dist.new_group(ranks=stage_1_ranks)
         else:
             topology = {"stage_0": [0], "stage_1": [1], "stage_2": [2]}
+            self._tp_group = None
 
         self.engine = SplitTrainingEngine(
             model_config=config.model_config,
@@ -54,6 +59,8 @@ class SplitMiddleWorker(Worker):
             checkpoint_config=config.checkpoint_config,
             topology=topology,
         )
+        # Store tp_group on engine so initialize() can pass it to TPMiddleStage.
+        self.engine._tp_group = self._tp_group
 
         # Override defaults from the prototype before initialize() loads weights.
         self.engine.model_path = config.model_path

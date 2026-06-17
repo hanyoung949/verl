@@ -248,21 +248,16 @@ class TPMiddleStage:
     TP so LoRA weights can be synced directly.
     """
 
-    def __init__(self, layers, rotary_emb, device, tp_rank: int, tp_size: int):
+    def __init__(self, layers, rotary_emb, device, tp_rank: int, tp_size: int, tp_group=None):
         self.device = torch.device(device)
         self.tp_rank = tp_rank
         self.tp_size = tp_size
         self.rotary_emb = rotary_emb
-
-        # Create a process group for just the TP ranks within stage_1.
-        # The global process group includes all ranks (stage_0/1/2), but
-        # TP all-reduce should only happen across stage_1 TP ranks.
-        stage_1_ranks = list(range(1, 1 + tp_size))  # ranks 1,2 for tp_size=2
-        self.tp_group = dist.new_group(ranks=stage_1_ranks)
+        self.tp_group = tp_group
 
         # Build TP layers from original layers
         self.layers = nn.ModuleList([
-            TPQwen2DecoderLayer(layer, tp_rank, tp_size, self.tp_group) for layer in layers
+            TPQwen2DecoderLayer(layer, tp_rank, tp_size, tp_group) for layer in layers
         ])
         self.layers.to(self.device)
         if self.rotary_emb is not None:

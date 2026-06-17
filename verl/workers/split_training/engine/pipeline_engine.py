@@ -174,6 +174,7 @@ class SplitTrainingEngine(BaseEngine):
                     "cuda",
                     tp_rank=rank_in_stage1,
                     tp_size=n_stage1,
+                    tp_group=getattr(self, '_tp_group', None),
                 )
                 print(f"[rank{self.rank}] TPMiddleStage: {len(self.stage.layers)} layers, "
                       f"tp_rank={rank_in_stage1}/{n_stage1}", flush=True)

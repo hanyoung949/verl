@@ -44,6 +44,10 @@ class SplitStageWorker(Worker):
                 "stage_1": list(range(1, 1 + stage_1_tp)),
                 "stage_2": [1 + stage_1_tp],
             }
+            # Create TP process group (collective: all ranks must participate).
+            import torch.distributed as dist
+            stage_1_ranks = list(range(1, 1 + stage_1_tp))
+            dist.new_group(ranks=stage_1_ranks)
         else:
             topology = {"stage_0": [0], "stage_1": [1], "stage_2": [2]}
 
