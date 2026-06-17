@@ -132,10 +132,11 @@ class TPQwen2Attention(nn.Module):
 
     def __init__(self, orig_attn, tp_rank: int, tp_size: int):
         super().__init__()
-        self.num_heads = orig_attn.num_heads
-        self.num_key_value_heads = orig_attn.num_key_value_heads
+        config = orig_attn.config
+        self.num_heads = config.num_attention_heads
+        self.num_key_value_heads = config.num_key_value_heads
         self.head_dim = orig_attn.head_dim
-        self.hidden_size = orig_attn.hidden_size
+        self.hidden_size = config.hidden_size
 
         # TP shard q/k/v/o projections
         self.q_proj = TPLinear(orig_attn.q_proj.weight.data, getattr(orig_attn.q_proj, 'bias', None), "column", tp_rank, tp_size)
