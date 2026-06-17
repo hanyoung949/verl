@@ -138,6 +138,11 @@ class vLLMHttpServer:
                 * self.config.pipeline_model_parallel_size
                 * self.config.data_parallel_size
             )
+            # For layer-wise split with stage_1 TP > 1, override world_size.
+            if getattr(self.config, "enable_layerwise_split", False):
+                stage_1_tp = getattr(self.config, "split_stage_1_tensor_parallel_size", 1)
+                if stage_1_tp > 1:
+                    world_size = 1 + stage_1_tp + 1
             os.environ["VLLM_RAY_BUNDLE_INDICES"] = ",".join(str(i) for i in range(world_size))
 
         if self.rollout_mode != RolloutMode.HYBRID and self.config.load_format == "dummy":

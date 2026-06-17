@@ -214,6 +214,12 @@ class RolloutReplica(ABC):
             * self.config.data_parallel_size
             * self.config.pipeline_model_parallel_size
         )
+        # For layer-wise split with stage_1 TP > 1, the actual worker count
+        # exceeds TP*DP*PP.  Override world_size to match the split topology.
+        if getattr(self.config, "enable_layerwise_split", False):
+            stage_1_tp = getattr(self.config, "split_stage_1_tensor_parallel_size", 1)
+            if stage_1_tp > 1:
+                self.world_size = 1 + stage_1_tp + 1
         self.gpus_per_node = gpus_per_node
 
         # Non-uniform layer-wise split topology is not described by a uniform
