@@ -421,17 +421,18 @@ class RolloutConfig(BaseConfig):
                         f"got {self.data_parallel_size}"
                     )
                 # World size sanity check: stage_0 + stage_1_TP + stage_2.
+                # Use n_gpus_per_node * nnodes if available (handles TP>1 in
+                # stage_1 where TP*DP*PP != actual worker count).
                 expected_world_size = 1 + stage_1_tp + 1
-                rollout_world_size = (
-                    self.tensor_model_parallel_size
-                    * self.data_parallel_size
-                    * self.pipeline_model_parallel_size
+                actual_world_size = (
+                    self.n_gpus_per_node * self.nnodes
+                    if self.n_gpus_per_node
+                    else self.tensor_model_parallel_size * self.data_parallel_size * self.pipeline_model_parallel_size
                 )
-                if rollout_world_size != expected_world_size:
+                if actual_world_size != expected_world_size:
                     raise ValueError(
                         f"Layer-wise split rollout world size mismatch: "
-                        f"tensor_model_parallel_size * data_parallel_size * pipeline_model_parallel_size = "
-                        f"{rollout_world_size}, but expected {expected_world_size} "
+                        f"actual={actual_world_size}, expected={expected_world_size} "
                         f"(1 + split_stage_1_tensor_parallel_size + 1 = 1 + {stage_1_tp} + 1)"
                     )
             elif self.name == "vllm" or self.name == "sglang" or self.name == "trtllm":
