@@ -93,6 +93,19 @@ class SplitTrainingEngine(BaseEngine):
     def stage_1_last_rank(self):
         return self.topology["stage_1"][-1]
 
+    @property
+    def stage_1_inter_stage_rank(self):
+        """Rank that handles inter-stage communication for stage_1.
+
+        In true TP mode (n_stage1 > 1), only the representative rank
+        (tp_rank=0 = stage_1_first_rank) communicates with stage_0/stage_2.
+        In pipeline-split mode (n_stage1 == 1), the single rank handles it.
+        """
+        n_stage1 = len(self.topology.get("stage_1", [1]))
+        if n_stage1 > 1:
+            return self.stage_1_first_rank
+        return self.stage_1_last_rank
+
     def _parse_config(self):
         if self.model_config is not None:
             self.model_path = getattr(self.model_config, "local_path", "")
@@ -196,7 +209,7 @@ class SplitTrainingEngine(BaseEngine):
                 clip_grad=self.clip_grad,
                 rotary_emb=rotary_emb.to("cuda") if rotary_emb is not None else None,
             )
-            self.transport = StageTransport(self.rank, self.stage_1_last_rank, "cuda")
+            self.transport = StageTransport(self.rank, self.stage_1_inter_stage_rank, "cuda")
             self.tokenizer = AutoTokenizer.from_pretrained(self._resolve_model_path(self.model_path))
             if self.tokenizer.pad_token is None:
                 self.tokenizer.pad_token = self.tokenizer.eos_token
@@ -248,7 +261,7 @@ class SplitTrainingEngine(BaseEngine):
 
     def _stage_2_forward_backward(self, data, loss_function, forward_only):
         header = torch.zeros(6, dtype=torch.int64, device="cuda")
-        dist.recv(header, src=self.stage_1_last_rank)
+        dist.recv(header, src=self.stage_1_inter_stage_rank)
         flag = int(header[0].item())
         if flag == PIPELINE_DONE:
             return {}
@@ -352,7 +365,7 @@ class SplitTrainingEngine(BaseEngine):
 
     def _stage_2_sample(self, data, temperature, pad_token_id):
         header = torch.zeros(6, dtype=torch.int64, device="cuda")
-        dist.recv(header, src=self.stage_1_last_rank)
+        dist.recv(header, src=self.stage_1_inter_stage_rank)
         flag = int(header[0].item())
         if flag == PIPELINE_DONE:
             return {}
