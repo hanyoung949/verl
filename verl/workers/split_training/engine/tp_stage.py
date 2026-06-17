@@ -107,6 +107,7 @@ class TPLinear(nn.Module):
             raise ValueError(f"Unknown mode: {mode}")
 
     def forward(self, x: Tensor) -> Tensor:
+        x = x.to(self.weight.dtype)
         out = F.linear(x, self.weight, self.bias if self.mode == "column" else None)
         if self.mode == "row":
             out = _TPAllReduce.apply(out, self.tp_rank, self.tp_size)
@@ -137,6 +138,7 @@ class TPLora(nn.Module):
             self.lora_b = nn.Parameter(lora_b.contiguous())
 
     def forward(self, x: Tensor) -> Tensor:
+        x = x.to(self.lora_a.dtype)
         out = F.linear(F.linear(x, self.lora_a), self.lora_b) * self.scaling
         if self.mode == "row":
             out = _TPAllReduce.apply(out, self.tp_rank, self.tp_size)
@@ -190,9 +192,9 @@ class TPQwen2Attention(nn.Module):
         v = self.v_proj(hidden_states)
 
         if self.q_lora is not None:
-            q = q + self.q_lora(hidden_states)
+            q = q + self.q_lora(hidden_states).to(q.dtype)
         if self.v_lora is not None:
-            v = v + self.v_lora(hidden_states)
+            v = v + self.v_lora(hidden_states).to(v.dtype)
 
         q = q.view(bsz, seq_len, self.num_heads_local, self.head_dim).transpose(1, 2)
         k = k.view(bsz, seq_len, self.num_kv_heads_local, self.head_dim).transpose(1, 2)
@@ -304,51 +306,96 @@ class TPMiddleStage:
         return None
 
     def _run_once_impl(self, topology, blocking_wait_for_header: bool):
+        """Run one forward/backward iteration.
+
+        tp_rank=0 is the "master": does inter-stage recv/send with stage_0/stage_2,
+        and broadcasts input to tp_rank=1 before forward.
+        tp_rank=1 is the "slave": receives input from tp_rank=0, participates in
+        TP all-reduce during forward/backward.
+        """
         t = topology or {"stage_0": [0], "stage_1": [1], "stage_2": [2]}
-        recv_rank = t["stage_0"][0]
-        send_rank = t["stage_2"][0]
+        stage_0_rank = t["stage_0"][0]
+        stage_2_rank = t["stage_2"][0]
+        peer = self._peer_global_rank()
         _VALID_FLAGS = {FWD_ONLY, FWD_WITH_BWD, SHUTDOWN, PIPELINE_DONE}
 
-        header = torch.zeros(6, dtype=torch.int64, device=self.device)
-        dist.recv(header, src=recv_rank)
-        flag = int(header[0].item())
+        is_master = (self.tp_rank == 0)
 
-        if flag not in _VALID_FLAGS:
-            raise RuntimeError(f"[TPStage1] illegal flag {flag} from rank {recv_rank}")
-
-        if flag == SHUTDOWN:
-            return False
-
-        dist.send(header.clone(), dst=send_rank)
-
-        if flag == PIPELINE_DONE:
-            return True
+        # --- Header exchange ---
+        if is_master:
+            header = torch.zeros(6, dtype=torch.int64, device=self.device)
+            dist.recv(header, src=stage_0_rank)
+            flag = int(header[0].item())
+            if flag not in _VALID_FLAGS:
+                raise RuntimeError(f"[TPStage1] illegal flag {flag}")
+            # Forward flag to slave and stage_2
+            dist.send(header.clone(), dst=peer)
+            if flag != SHUTDOWN and flag != PIPELINE_DONE:
+                dist.send(header.clone(), dst=stage_2_rank)
+            elif flag == SHUTDOWN:
+                return False
+            elif flag == PIPELINE_DONE:
+                dist.send(header.clone(), dst=stage_2_rank)
+                return True
+        else:
+            header = torch.zeros(6, dtype=torch.int64, device=self.device)
+            dist.recv(header, src=peer)
+            flag = int(header[0].item())
+            if flag == SHUTDOWN:
+                return False
+            if flag == PIPELINE_DONE:
+                return True
 
         B, S, H, has_mask, dtype_code = [int(x) for x in header[1:].tolist()]
         tensor_dtype = _DTYPE_MAP[dtype_code]
-        h = self._recv_tensor((B, S, H), tensor_dtype, recv_rank)
-        pos_ids = self._recv_tensor((B, S), torch.int64, recv_rank)
-        mask = self._recv_tensor((B, 1, S, S), tensor_dtype, recv_rank) if has_mask else None
 
+        # --- Receive/broadcast input ---
+        if is_master:
+            h = self._recv_tensor((B, S, H), tensor_dtype, stage_0_rank)
+            pos_ids = self._recv_tensor((B, S), torch.int64, stage_0_rank)
+            mask = self._recv_tensor((B, 1, S, S), tensor_dtype, stage_0_rank) if has_mask else None
+            # Broadcast to slave
+            dist.send(h.contiguous(), dst=peer)
+            dist.send(pos_ids.contiguous(), dst=peer)
+            if mask is not None:
+                dist.send(mask.contiguous(), dst=peer)
+        else:
+            h = self._recv_tensor((B, S, H), tensor_dtype, peer)
+            pos_ids = self._recv_tensor((B, S), torch.int64, peer)
+            mask = self._recv_tensor((B, 1, S, S), tensor_dtype, peer) if has_mask else None
+
+        # --- Forward / backward ---
         if flag == FWD_ONLY:
             with torch.no_grad():
                 pos_emb = self._get_pos_emb(h, pos_ids)
                 h_out = self.forward(h, position_embeddings=pos_emb, attention_mask=mask)
-            self._send_tensor(h_out, send_rank)
-            self._send_tensor(pos_ids, send_rank)
+            if is_master:
+                self._send_tensor(h_out, stage_2_rank)
+                self._send_tensor(pos_ids, stage_2_rank)
 
         elif flag == FWD_WITH_BWD:
             h_in = h.detach().requires_grad_(True)
             pos_emb = self._get_pos_emb(h_in, pos_ids)
             h_out = self.forward(h_in, position_embeddings=pos_emb, attention_mask=mask)
-            self._send_tensor(h_out.detach(), send_rank)
-            self._send_tensor(pos_ids, send_rank)
 
-            grad_out = self._recv_tensor(h_out.shape, h_out.dtype, send_rank)
-            torch.autograd.backward(h_out, grad_out)
-            self._send_tensor(h_in.grad, recv_rank)
+            if is_master:
+                self._send_tensor(h_out.detach(), stage_2_rank)
+                self._send_tensor(pos_ids, stage_2_rank)
+
+                grad_out = self._recv_tensor(h_out.shape, h_out.dtype, stage_2_rank)
+                # Forward grad to slave so both can backward
+                dist.send(grad_out.contiguous(), dst=peer)
+                torch.autograd.backward(h_out, grad_out)
+                self._send_tensor(h_in.grad, stage_0_rank)
+            else:
+                grad_out = self._recv_tensor(h_out.shape, h_out.dtype, peer)
+                torch.autograd.backward(h_out, grad_out)
 
         return True
+
+    def _peer_global_rank(self):
+        global_ranks = list(range(1, 1 + self.tp_size))
+        return global_ranks[1 - self.tp_rank]
 
     def run_once(self, topology=None):
         return self._run_once_impl(topology, blocking_wait_for_header=True)

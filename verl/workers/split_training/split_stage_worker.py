@@ -117,7 +117,7 @@ class SplitStageWorker(Worker):
 
     def reset(self):
         """Re-initialize the engine (reload weights/optimizers)."""
-        # Force NCCL communicator setup between all rank pairs.
+        import torch
         import torch.distributed as dist
         world_size = dist.get_world_size()
         rank = dist.get_rank()
