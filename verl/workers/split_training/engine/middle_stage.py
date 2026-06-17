@@ -24,12 +24,20 @@ from .transport import FWD_ONLY, FWD_WITH_BWD, SHUTDOWN, PIPELINE_DONE, _DTYPE_M
 
 
 class Stage1:
-    """Stage_1 (Cloud Body): frozen middle layers that relay between stage_0 and stage_2."""
+    """Stage_1 (Cloud Body): frozen middle layers that relay between stage_0 and stage_2.
 
-    def __init__(self, layers, rotary_emb, device):
+    Supports multi-rank pipeline-split: when stage_1 has multiple ranks, each
+    rank handles a subset of layers.  ``src_rank`` is where activations come
+    from (stage_0 or previous stage_1 rank), ``dst_rank`` is where they go
+    (stage_2 or next stage_1 rank).
+    """
+
+    def __init__(self, layers, rotary_emb, device, src_rank=None, dst_rank=None):
         self.layers = nn.ModuleList(layers)
         self.rotary_emb = rotary_emb
         self.device = torch.device(device)
+        self.src_rank = src_rank
+        self.dst_rank = dst_rank
 
         for p in self.layers.parameters():
             p.requires_grad = False
@@ -63,17 +71,18 @@ class Stage1:
 
     def _run_once_impl(self, topology, blocking_wait_for_header: bool):
         t = topology or {"stage_0": [0], "stage_1": [1], "stage_2": [2]}
-        stage_0_rank = t["stage_0"][0]
-        stage_2_rank = t["stage_2"][0]
+        # Use explicit src/dst if set (multi-rank stage_1), otherwise derive from topology.
+        recv_rank = self.src_rank if self.src_rank is not None else t["stage_0"][0]
+        send_rank = self.dst_rank if self.dst_rank is not None else t["stage_2"][0]
         _VALID_FLAGS = {FWD_ONLY, FWD_WITH_BWD, SHUTDOWN, PIPELINE_DONE}
 
         header = torch.zeros(6, dtype=torch.int64, device=self.device)
-        dist.recv(header, src=stage_0_rank)
+        dist.recv(header, src=recv_rank)
         flag = int(header[0].item())
 
         if flag not in _VALID_FLAGS:
             raise RuntimeError(
-                f"[Stage1] received illegal flag {flag} from rank {stage_0_rank}. "
+                f"[Stage1] received illegal flag {flag} from rank {recv_rank}. "
                 f"Valid flags: {_VALID_FLAGS}. "
                 f"This usually means a stage_0 -> stage_2 direct message leaked into the stage_1 pipeline."
             )
@@ -81,17 +90,17 @@ class Stage1:
         if flag == SHUTDOWN:
             return False
 
-        dist.send(header.clone(), dst=stage_2_rank)
+        dist.send(header.clone(), dst=send_rank)
 
         if flag == PIPELINE_DONE:
             return True
 
         B, S, H, has_mask, dtype_code = [int(x) for x in header[1:].tolist()]
         tensor_dtype = _DTYPE_MAP[dtype_code]
-        h = self._recv_tensor((B, S, H), tensor_dtype, stage_0_rank)
-        pos_ids = self._recv_tensor((B, S), torch.int64, stage_0_rank)
+        h = self._recv_tensor((B, S, H), tensor_dtype, recv_rank)
+        pos_ids = self._recv_tensor((B, S), torch.int64, recv_rank)
         if has_mask:
-            mask = self._recv_tensor((B, 1, S, S), tensor_dtype, stage_0_rank)
+            mask = self._recv_tensor((B, 1, S, S), tensor_dtype, recv_rank)
         else:
             mask = None
 
@@ -116,8 +125,8 @@ class Stage1:
                     position_embeddings=pos_emb,
                     attention_mask=mask,
                 )
-            self._send_tensor(h_out, stage_2_rank)
-            self._send_tensor(pos_ids, stage_2_rank)
+            self._send_tensor(h_out, send_rank)
+            self._send_tensor(pos_ids, send_rank)
 
         elif flag == FWD_WITH_BWD:
             h_in = h.detach().requires_grad_(True)
@@ -127,12 +136,12 @@ class Stage1:
                 position_embeddings=pos_emb,
                 attention_mask=mask,
             )
-            self._send_tensor(h_out.detach(), stage_2_rank)
-            self._send_tensor(pos_ids, stage_2_rank)
+            self._send_tensor(h_out.detach(), send_rank)
+            self._send_tensor(pos_ids, send_rank)
 
-            grad_out = self._recv_tensor(h_out.shape, h_out.dtype, stage_2_rank)
+            grad_out = self._recv_tensor(h_out.shape, h_out.dtype, send_rank)
             torch.autograd.backward(h_out, grad_out)
-            self._send_tensor(h_in.grad, stage_0_rank)
+            self._send_tensor(h_in.grad, recv_rank)
 
         return True
 

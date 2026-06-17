@@ -26,6 +26,9 @@ class SplitMiddleWorker(Worker):
     Stage_1 is frozen and only forwards activations / backward gradients
     between stage_0 and stage_2. It exposes synchronous train/infer methods so
     the driver can invoke all stages concurrently.
+
+    Supports multi-rank stage_1 (pipeline-split): when stage_1 has multiple
+    ranks, each rank handles a subset of layers and relays to the next rank.
     """
 
     def __init__(self, config):
@@ -33,7 +36,16 @@ class SplitMiddleWorker(Worker):
         initialize_global_process_group(timeout_second=300)
 
         self.config = config
-        topology = {"stage_0": [0], "stage_1": [1], "stage_2": [2]}
+        # Build topology from config or use default 3-rank layout.
+        stage_1_tp = getattr(config, 'stage_1_tp', 1)
+        if stage_1_tp > 1:
+            topology = {
+                "stage_0": [0],
+                "stage_1": list(range(1, 1 + stage_1_tp)),
+                "stage_2": [1 + stage_1_tp],
+            }
+        else:
+            topology = {"stage_0": [0], "stage_1": [1], "stage_2": [2]}
 
         self.engine = SplitTrainingEngine(
             model_config=config.model_config,

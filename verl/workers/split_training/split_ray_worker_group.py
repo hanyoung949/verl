@@ -47,10 +47,10 @@ def _get_free_port() -> int:
 
 
 class SplitRayWorkerGroup:
-    """A minimal worker group that places 3 split-training actors on 3 GPUs.
+    """A worker group that places split-training actors on GPUs.
 
-    This is intentionally lightweight for Phase B0/B1/B2: it does not reuse the
-    generic ``RayWorkerGroup`` because stage_0/stage_1/stage_2 are heterogeneous.
+    Supports both 3-rank (stage_1 TP=1) and N-rank (stage_1 TP>1) layouts.
+    For 4 ranks: rank0=stage_0, rank1=stage_1_tp0, rank2=stage_1_tp1, rank3=stage_2.
     """
 
     def __init__(
@@ -59,32 +59,42 @@ class SplitRayWorkerGroup:
         num_gpus: int = 3,
         name_prefix: str = "split",
         node_ip: Optional[str] = None,
+        stage_1_tp: int = 1,
     ) -> None:
         self.config = config
         self.name_prefix = name_prefix
         self.num_gpus = num_gpus
-        assert num_gpus == 3, "Phase B0 only supports a 3-stage pipeline (stage_0/stage_1/stage_2)."
+        self.stage_1_tp = stage_1_tp
+        expected_gpus = 2 + stage_1_tp  # stage_0 + stage_1_tp + stage_2
+        assert num_gpus == expected_gpus, (
+            f"Expected {expected_gpus} GPUs for stage_1_tp={stage_1_tp}, got {num_gpus}"
+        )
 
         self.node_ip = node_ip or ray.util.get_node_ip_address()
         self.master_addr = self.node_ip
         self.master_port = _get_free_port()
 
-        # One placement group with 3 GPU bundles, packed onto the same node.
+        # Build topology: stage_0=[0], stage_1=[1..stage_1_tp], stage_2=[1+stage_1_tp]
+        self.topology = {
+            "stage_0": [0],
+            "stage_1": list(range(1, 1 + stage_1_tp)),
+            "stage_2": [1 + stage_1_tp],
+        }
+
         bundles = [{"CPU": 4, "GPU": 1} for _ in range(num_gpus)]
         if self.node_ip is not None:
             for b in bundles:
                 b[f"node:{self.node_ip}"] = 0.001
         self.pg = placement_group(
-            bundles=bundles,
-            strategy="STRICT_PACK",
-            name=f"{name_prefix}_pg",
+            bundles=bundles, strategy="STRICT_PACK", name=f"{name_prefix}_pg",
         )
         ray.get(self.pg.ready())
 
         self.actors: list[Any] = []
         self._create_actor(rank=0, cls=SplitStageWorker)
-        self._create_actor(rank=1, cls=SplitMiddleWorker)
-        self._create_actor(rank=2, cls=SplitStageWorker)
+        for r in range(1, 1 + stage_1_tp):
+            self._create_actor(rank=r, cls=SplitMiddleWorker)
+        self._create_actor(rank=1 + stage_1_tp, cls=SplitStageWorker)
 
     def _create_actor(self, rank: int, cls):
         env_vars = {
@@ -110,53 +120,60 @@ class SplitRayWorkerGroup:
         )
         self.actors.append(actor)
 
+    @property
+    def stage_0_actor(self):
+        return self.actors[0]
+
+    @property
+    def stage_2_actor(self):
+        return self.actors[-1]
+
+    @property
+    def stage_1_actors(self):
+        return self.actors[1:-1]
+
     def reset(self):
-        """Initialize / re-initialize all stage workers."""
         refs = [a.reset.remote() for a in self.actors]
         return ray.get(refs)
 
     def train_micro_batch(self, data: dict) -> dict:
-        """Run one forward/backward/optimizer step across the 3-stage pipeline."""
-        stage_0_ref = self.actors[0].train_micro_batch.remote(data)
-        stage_1_ref = self.actors[1].train_micro_batch.remote()
-        stage_2_ref = self.actors[2].train_micro_batch.remote(data)
-
-        stage_0_out, stage_1_out, stage_2_out = ray.get([stage_0_ref, stage_1_ref, stage_2_ref])
-        return {
-            "stage_0": stage_0_out,
-            "stage_1": stage_1_out,
-            "stage_2": stage_2_out,
-            "head": stage_0_out,
-            "middle": stage_1_out,
-            "tail": stage_2_out,
-        }
+        """Run one forward/backward/optimizer step across the pipeline."""
+        refs = []
+        for i, actor in enumerate(self.actors):
+            if i == 0 or i == len(self.actors) - 1:
+                refs.append(actor.train_micro_batch.remote(data))
+            else:
+                refs.append(actor.train_micro_batch.remote())
+        results = ray.get(refs)
+        out = {}
+        for i, r in enumerate(results):
+            stage = "stage_0" if i == 0 else ("stage_2" if i == len(self.actors) - 1 else f"stage_1_tp{i-1}")
+            out[stage] = r
+        out["head"] = out["stage_0"]
+        out["tail"] = out["stage_2"]
+        return out
 
     def infer_micro_batch(self, data: dict) -> dict:
-        """Run one forward-only pass across the 3-stage pipeline."""
-        stage_0_ref = self.actors[0].infer_micro_batch.remote(data)
-        stage_1_ref = self.actors[1].infer_micro_batch.remote()
-        stage_2_ref = self.actors[2].infer_micro_batch.remote(data)
-
-        stage_0_out, stage_1_out, stage_2_out = ray.get([stage_0_ref, stage_1_ref, stage_2_ref])
-        return {
-            "stage_0": stage_0_out,
-            "stage_1": stage_1_out,
-            "stage_2": stage_2_out,
-            "head": stage_0_out,
-            "middle": stage_1_out,
-            "tail": stage_2_out,
-        }
+        """Run one forward-only pass across the pipeline."""
+        refs = []
+        for i, actor in enumerate(self.actors):
+            if i == 0 or i == len(self.actors) - 1:
+                refs.append(actor.infer_micro_batch.remote(data))
+            else:
+                refs.append(actor.infer_micro_batch.remote())
+        results = ray.get(refs)
+        out = {}
+        for i, r in enumerate(results):
+            stage = "stage_0" if i == 0 else ("stage_2" if i == len(self.actors) - 1 else f"stage_1_tp{i-1}")
+            out[stage] = r
+        out["head"] = out["stage_0"]
+        out["tail"] = out["stage_2"]
+        return out
 
     def get_trainable_state_dict(self):
-        """Return trainable state dicts from stage_0 and stage_2."""
         stage_0_state = ray.get(self.actors[0].get_trainable_state_dict.remote())
-        stage_2_state = ray.get(self.actors[2].get_trainable_state_dict.remote())
-        return {
-            "stage_0": stage_0_state,
-            "stage_2": stage_2_state,
-            "head": stage_0_state,
-            "tail": stage_2_state,
-        }
+        stage_2_state = ray.get(self.actors[-1].get_trainable_state_dict.remote())
+        return {"stage_0": stage_0_state, "stage_2": stage_2_state, "head": stage_0_state, "tail": stage_2_state}
 
     def export_merged_lora_state_dict(self) -> dict[str, torch.Tensor]:
         """Return stage_0 + stage_2 LoRA weights as a single in-memory PEFT state dict.
@@ -243,9 +260,6 @@ class SplitRayWorkerGroup:
         return local_path
 
     def shutdown(self):
-        # Shutdown actors, kill them, and release the placement group so GPUs
-        # are not held after training finishes (important when rollout reuses
-        # the same Ray cluster with non-uniform resource pools).
         refs = [a.shutdown.remote() for a in self.actors]
         result = ray.get(refs)
         for a in self.actors:
@@ -254,8 +268,6 @@ class SplitRayWorkerGroup:
         if self.pg is not None:
             pg_id = self.pg.id
             remove_placement_group(self.pg)
-            # Wait until the placement group is actually removed so the next
-            # rollout placement group does not starve for GPUs.
             for _ in range(120):
                 table = ray.util.placement_group_table()
                 state = table.get(pg_id, {}).get("state")
