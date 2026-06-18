@@ -71,23 +71,24 @@ class SplitMiddleWorker(Worker):
         """Re-initialize the engine (reload frozen middle weights).
 
         IMPORTANT: all ranks must call reset() concurrently (e.g. via
-        ``ray.get([a.reset.remote() for a in actors])``).  The all-pairs
-        ping below is a collective — if called sequentially it will deadlock.
+        ``ray.get([a.reset.remote() for a in actors])``).  The ping below
+        is a collective — if called sequentially it will deadlock.
         """
         import torch
         import torch.distributed as dist
         world_size = dist.get_world_size()
         rank = dist.get_rank()
         dummy = torch.zeros(1, device="cuda")
-        for peer in range(world_size):
-            if peer == rank:
-                continue
-            if peer > rank:
-                dist.send(dummy, dst=peer)
-                dist.recv(dummy, src=peer)
-            else:
-                dist.recv(dummy, src=peer)
-                dist.send(dummy, dst=peer)
+        # Only ping adjacent ranks in a ring (not all-pairs) to avoid
+        # creating O(N^2) NCCL communicators which is too slow for N>=8.
+        next_rank = (rank + 1) % world_size
+        prev_rank = (rank - 1) % world_size
+        if rank % 2 == 0:
+            dist.send(dummy, dst=next_rank)
+            dist.recv(dummy, src=next_rank)
+        else:
+            dist.recv(dummy, src=prev_rank)
+            dist.send(dummy, dst=prev_rank)
         dist.barrier()
         self.engine.initialize()
         return {"rank": self._rank, "stage": "stage_1"}
