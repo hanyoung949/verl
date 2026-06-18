@@ -32,8 +32,14 @@ class SplitStageWorker(Worker):
     """
 
     def __init__(self, config):
+        import time, os
+        t0 = time.time()
+        rank_env = os.environ.get("RANK", "?")
+        print(f"[rank{rank_env}] __init__ start", flush=True)
         Worker.__init__(self)
+        print(f"[rank{rank_env}] Worker.__init__ done {time.time()-t0:.1f}s", flush=True)
         initialize_global_process_group(timeout_second=300)
+        print(f"[rank{rank_env}] init_process_group done {time.time()-t0:.1f}s", flush=True)
 
         self.config = config
         stage_1_tp = getattr(config, 'stage_1_tp', 1)
