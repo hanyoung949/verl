@@ -4,8 +4,7 @@ Implements true TP (not pipeline-split) for stage_1 layers, matching vLLM's
 inference-side TP sharding so that WeightSyncManager can directly sync LoRA
 weights without repartitioning.
 
-Current limitation: only supports tp_size=2 via manual send/recv all-reduce.
-This avoids ``dist.new_group`` NCCL issues with mixed PP+TP topologies.
+Supports arbitrary TP size via ring all-reduce (send/recv).
 
 TP sharding convention (same as vLLM/Megatron):
   - Column-parallel (q_proj, k_proj, v_proj, gate_proj, up_proj):
@@ -28,28 +27,34 @@ from .transport import FWD_ONLY, FWD_WITH_BWD, SHUTDOWN, PIPELINE_DONE, _DTYPE_M
 
 
 # ---------------------------------------------------------------------------
-# Manual 2-rank all-reduce (avoids dist.new_group NCCL issues)
+# Ring all-reduce via send/recv (avoids dist.new_group NCCL issues)
 # ---------------------------------------------------------------------------
 
 def _tp_all_reduce(x: Tensor, tp_rank: int, tp_size: int) -> Tensor:
-    """Manual 2-rank all-reduce using send/recv.
+    """Ring all-reduce using send/recv for arbitrary TP size.
 
-    Maps TP rank to global rank: TP ranks 0,1 → global ranks 1,2.
-    Rank 0 sends partial sum to rank 1; rank 1 sums and sends back.
+    Maps TP ranks to global ranks: TP rank i → global rank (1 + i).
+    After tp_size-1 ring steps, every rank holds the full sum.
+
+    This avoids ``dist.new_group`` which has NCCL init timing issues in
+    mixed PP+TP Ray actor topologies.
     """
-    assert tp_size == 2, "Only tp_size=2 is supported for manual all-reduce"
-    global_ranks = list(range(1, 1 + tp_size))
-    peer = global_ranks[1 - tp_rank]
+    if tp_size == 1:
+        return x
 
-    if tp_rank == 0:
-        dist.send(x.contiguous(), dst=peer)
-        dist.recv(x, src=peer)
-    else:
-        buf = torch.empty_like(x)
-        dist.recv(buf, src=peer)
-        x = x + buf
-        dist.send(x.contiguous(), dst=peer)
-    return x
+    global_ranks = list(range(1, 1 + tp_size))
+    next_rank = global_ranks[(tp_rank + 1) % tp_size]
+    prev_rank = global_ranks[(tp_rank - 1) % tp_size]
+
+    buf = x.clone()
+    for _ in range(tp_size - 1):
+        send_buf = buf.contiguous()
+        recv_buf = torch.empty_like(buf)
+        send_req = dist.isend(send_buf, dst=next_rank)
+        dist.recv(recv_buf, src=prev_rank)
+        send_req.wait()
+        buf = buf + recv_buf
+    return buf
 
 
 class _TPAllReduce(torch.autograd.Function):
@@ -71,8 +76,7 @@ class _TPAllReduceGrad(torch.autograd.Function):
 
     NOTE: currently unused — grad aggregation for column-parallel backward is
     handled directly in TPMiddleStage._run_once_impl (master collects slave's
-    partial grad_input and sums).  Kept for future tp_size>2 support where
-    in-graph all-reduce may be cleaner than explicit send/recv.
+    partial grad_input and sums).  Kept for future in-graph all-reduce support.
     """
 
     @staticmethod
@@ -261,11 +265,13 @@ class TPQwen2DecoderLayer(nn.Module):
 # ---------------------------------------------------------------------------
 
 class TPMiddleStage:
-    """Stage_1 with true Tensor Parallelism (tp_size=2 only).
+    """Stage_1 with true Tensor Parallelism.
 
     Each TP rank holds a shard of every layer's weights.  Forward/backward
-    uses manual send/recv all-reduce for row-parallel layers.  Matches vLLM's
-    inference TP so LoRA weights sync directly.
+    uses ring all-reduce via send/recv for row-parallel layers.  Matches
+    vLLM's inference TP so LoRA weights sync directly.
+
+    Supports arbitrary tp_size (2, 4, 8, ...).
     """
 
     def __init__(self, layers, rotary_emb, device, tp_rank: int, tp_size: int):
@@ -309,14 +315,15 @@ class TPMiddleStage:
         """Run one forward/backward iteration.
 
         tp_rank=0 is the "master": does inter-stage recv/send with stage_0/stage_2,
-        and broadcasts input to tp_rank=1 before forward.
-        tp_rank=1 is the "slave": receives input from tp_rank=0, participates in
-        TP all-reduce during forward/backward.
+        and broadcasts input to all other TP ranks before forward.
+        tp_rank>0 are "slaves": receive input from master, participate in
+        TP ring all-reduce during forward/backward.
         """
         t = topology or {"stage_0": [0], "stage_1": [1], "stage_2": [2]}
         stage_0_rank = t["stage_0"][0]
         stage_2_rank = t["stage_2"][0]
-        peer = self._peer_global_rank()
+        global_ranks = list(range(1, 1 + self.tp_size))
+        slave_ranks = global_ranks[1:]  # all ranks except master
         _VALID_FLAGS = {FWD_ONLY, FWD_WITH_BWD, SHUTDOWN, PIPELINE_DONE}
 
         is_master = (self.tp_rank == 0)
@@ -328,18 +335,18 @@ class TPMiddleStage:
             flag = int(header[0].item())
             if flag not in _VALID_FLAGS:
                 raise RuntimeError(f"[TPStage1] illegal flag {flag}")
-            # Forward flag to slave and stage_2
-            dist.send(header.clone(), dst=peer)
-            if flag != SHUTDOWN and flag != PIPELINE_DONE:
-                dist.send(header.clone(), dst=stage_2_rank)
-            elif flag == SHUTDOWN:
+            for r in slave_ranks:
+                dist.send(header.clone(), dst=r)
+            if flag == SHUTDOWN:
                 return False
-            elif flag == PIPELINE_DONE:
+            if flag == PIPELINE_DONE:
                 dist.send(header.clone(), dst=stage_2_rank)
                 return True
+            dist.send(header.clone(), dst=stage_2_rank)
         else:
             header = torch.zeros(6, dtype=torch.int64, device=self.device)
-            dist.recv(header, src=peer)
+            master_rank = global_ranks[0]
+            dist.recv(header, src=master_rank)
             flag = int(header[0].item())
             if flag == SHUTDOWN:
                 return False
@@ -354,15 +361,16 @@ class TPMiddleStage:
             h = self._recv_tensor((B, S, H), tensor_dtype, stage_0_rank)
             pos_ids = self._recv_tensor((B, S), torch.int64, stage_0_rank)
             mask = self._recv_tensor((B, 1, S, S), tensor_dtype, stage_0_rank) if has_mask else None
-            # Broadcast to slave
-            dist.send(h.contiguous(), dst=peer)
-            dist.send(pos_ids.contiguous(), dst=peer)
-            if mask is not None:
-                dist.send(mask.contiguous(), dst=peer)
+            for r in slave_ranks:
+                dist.send(h.contiguous(), dst=r)
+                dist.send(pos_ids.contiguous(), dst=r)
+                if mask is not None:
+                    dist.send(mask.contiguous(), dst=r)
         else:
-            h = self._recv_tensor((B, S, H), tensor_dtype, peer)
-            pos_ids = self._recv_tensor((B, S), torch.int64, peer)
-            mask = self._recv_tensor((B, 1, S, S), tensor_dtype, peer) if has_mask else None
+            master_rank = global_ranks[0]
+            h = self._recv_tensor((B, S, H), tensor_dtype, master_rank)
+            pos_ids = self._recv_tensor((B, S), torch.int64, master_rank)
+            mask = self._recv_tensor((B, 1, S, S), tensor_dtype, master_rank) if has_mask else None
 
         # --- Forward / backward ---
         if flag == FWD_ONLY:
@@ -383,26 +391,27 @@ class TPMiddleStage:
                 self._send_tensor(pos_ids, stage_2_rank)
 
                 grad_out = self._recv_tensor(h_out.shape, h_out.dtype, stage_2_rank)
-                # Forward grad to slave so both can backward
-                dist.send(grad_out.contiguous(), dst=peer)
+                for r in slave_ranks:
+                    dist.send(grad_out.contiguous(), dst=r)
                 torch.autograd.backward(h_out, grad_out)
 
-                # Collect slave's grad_input and merge (column-parallel backward
-                # produces partial gradients that must be summed across TP ranks).
-                slave_grad = self._recv_tensor(h_in.grad.shape, h_in.grad.dtype, peer)
-                full_grad = h_in.grad + slave_grad
+                # Collect slave grad_inputs and merge
+                full_grad = h_in.grad.clone()
+                for r in slave_ranks:
+                    slave_grad = self._recv_tensor(h_in.grad.shape, h_in.grad.dtype, r)
+                    full_grad = full_grad + slave_grad
                 self._send_tensor(full_grad, stage_0_rank)
             else:
-                grad_out = self._recv_tensor(h_out.shape, h_out.dtype, peer)
+                master_rank = global_ranks[0]
+                grad_out = self._recv_tensor(h_out.shape, h_out.dtype, master_rank)
                 torch.autograd.backward(h_out, grad_out)
-                # Send partial grad_input to master for aggregation
-                dist.send(h_in.grad.contiguous(), dst=peer)
+                dist.send(h_in.grad.contiguous(), dst=master_rank)
 
         return True
 
     def _peer_global_rank(self):
-        global_ranks = list(range(1, 1 + self.tp_size))
-        return global_ranks[1 - self.tp_rank]
+        """Global rank of the first slave (kept for backward compat)."""
+        return list(range(1, 1 + self.tp_size))[1]
 
     def run_once(self, topology=None):
         return self._run_once_impl(topology, blocking_wait_for_header=True)

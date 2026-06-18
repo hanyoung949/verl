@@ -38,7 +38,7 @@ class SplitStageWorkerConfig:
     lora_dropout: float = 0.0
     lora_target_modules: list[str] = field(default_factory=lambda: ["q_proj", "v_proj"])
 
-    stage_1_tp: int = 1  # Number of ranks for stage_1 (1=single rank, 2=pipeline-split)
+    stage_1_tp: int = 1  # Number of TP ranks for stage_1 (1=single rank, 2+=true TP)
 
     # Placeholders to stay compatible with the BaseEngine signature in the future.
     model_config: Optional[Any] = None
