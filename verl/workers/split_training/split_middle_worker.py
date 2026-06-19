@@ -88,18 +88,9 @@ class SplitMiddleWorker(Worker):
         world_size = dist.get_world_size()
         print(f"[rank{rank}] reset start, world_size={world_size}", flush=True)
 
-        dummy = torch.zeros(1, device="cuda")
+        # Warm up CUDA context before barrier
+        _ = torch.zeros(1, device="cuda")
         print(f"[rank{rank}] cuda context ready {time.time()-t0:.1f}s", flush=True)
-
-        next_rank = (rank + 1) % world_size
-        prev_rank = (rank - 1) % world_size
-        if rank % 2 == 0:
-            dist.send(dummy, dst=next_rank)
-            dist.recv(dummy, src=next_rank)
-        else:
-            dist.recv(dummy, src=prev_rank)
-            dist.send(dummy, dst=prev_rank)
-        print(f"[rank{rank}] ring ping done {time.time()-t0:.1f}s", flush=True)
 
         dist.barrier()
         print(f"[rank{rank}] barrier done {time.time()-t0:.1f}s", flush=True)

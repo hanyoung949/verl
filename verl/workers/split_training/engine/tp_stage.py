@@ -31,10 +31,16 @@ from .transport import FWD_ONLY, FWD_WITH_BWD, SHUTDOWN, PIPELINE_DONE, _DTYPE_M
 # ---------------------------------------------------------------------------
 
 def _tp_all_reduce(x: Tensor, tp_rank: int, tp_size: int) -> Tensor:
-    """Ring all-reduce using send/recv for arbitrary TP size.
+    """Ring all-reduce using send/recv. Correct for any tp_size.
 
     Maps TP ranks to global ranks: TP rank i → global rank (1 + i).
-    After tp_size-1 ring steps, every rank holds the full sum.
+    Each step forwards the *received* buffer (not the accumulated result)
+    to the next rank, so every rank correctly accumulates sum(x_i) after
+    tp_size-1 steps.
+
+    Only communicates with adjacent next/prev ranks, so NCCL lazy
+    communicator creation stays within a single 2-rank pattern — no
+    risk of deadlocking non-participating ranks in the global PG.
 
     This avoids ``dist.new_group`` which has NCCL init timing issues in
     mixed PP+TP Ray actor topologies.
@@ -46,15 +52,24 @@ def _tp_all_reduce(x: Tensor, tp_rank: int, tp_size: int) -> Tensor:
     next_rank = global_ranks[(tp_rank + 1) % tp_size]
     prev_rank = global_ranks[(tp_rank - 1) % tp_size]
 
+    result = x.clone()
     buf = x.clone()
+
     for _ in range(tp_size - 1):
-        send_buf = buf.contiguous()
-        recv_buf = torch.empty_like(buf)
-        send_req = dist.isend(send_buf, dst=next_rank)
-        dist.recv(recv_buf, src=prev_rank)
+        if tp_rank % 2 == 0:
+            send_req = dist.isend(buf.contiguous(), dst=next_rank)
+            recv_buf = torch.empty_like(buf)
+            dist.recv(recv_buf, src=prev_rank)
+        else:
+            recv_buf = torch.empty_like(buf)
+            dist.recv(recv_buf, src=prev_rank)
+            send_req = dist.isend(buf.contiguous(), dst=next_rank)
         send_req.wait()
-        buf = buf + recv_buf
-    return buf
+
+        result = result + recv_buf
+        buf = recv_buf  # forward received, not accumulated result
+
+    return result
 
 
 class _TPAllReduce(torch.autograd.Function):
@@ -268,8 +283,8 @@ class TPMiddleStage:
     """Stage_1 with true Tensor Parallelism.
 
     Each TP rank holds a shard of every layer's weights.  Forward/backward
-    uses ring all-reduce via send/recv for row-parallel layers.  Matches
-    vLLM's inference TP so LoRA weights sync directly.
+    uses ring all-reduce via send/recv for row-parallel layers.
+    Matches vLLM's inference TP so LoRA weights sync directly.
 
     Supports arbitrary tp_size (2, 4, 8, ...).
     """
