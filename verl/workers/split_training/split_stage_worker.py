@@ -21,6 +21,7 @@ import torch.nn.functional as F
 from verl.workers.split_training.engine import SplitTrainingEngine
 from verl.single_controller.base import Worker
 from verl.utils.distributed import initialize_global_process_group
+from verl.trainer.ppo.core_algos import agg_loss
 from verl.utils.torch_functional import logprobs_from_logits_naive
 
 
@@ -93,27 +94,65 @@ class SplitStageWorker(Worker):
         )
         return {"loss": loss, "metrics": {}}
 
-    @staticmethod
-    def _grpo_loss(logits: torch.Tensor, data: dict) -> dict[str, Any]:
-        """Minimal GRPO policy-gradient loss on response tokens."""
+    def _grpo_loss(self, logits: torch.Tensor, data: dict) -> dict[str, Any]:
+        """GRPO policy-gradient loss on response tokens.
+
+        Supports:
+          - symmetric / asymmetric clip (DAPO-style cliprange_low/high)
+          - loss aggregation modes: token-mean, seq-mean-token-sum,
+            seq-mean-token-sum-norm
+          - loss_scale_factor (used by seq-mean-token-sum-norm)
+        """
         input_ids = data["input_ids"].to(logits.device)
         response_mask = data["response_mask"].to(logits.device).bool()
         old_log_probs = data["old_log_probs"].to(logits.device)
         advantages = data["advantages"].to(logits.device)
-        eps = data.get("clip_range", 0.2)
+
+        # Clip bounds: data overrides config; missing low/high defaults to clip_range.
+        cfg = self.config
+        eps = data.get("clip_range", cfg.clip_range)
+        clip_low = data.get("clip_range_low", data.get("cliprange_low", cfg.clip_range_low))
+        clip_high = data.get("clip_range_high", data.get("cliprange_high", cfg.clip_range_high))
+        if clip_low is None:
+            clip_low = eps
+        if clip_high is None:
+            clip_high = eps
+
+        loss_agg_mode = data.get("loss_agg_mode", cfg.loss_agg_mode)
+        loss_scale_factor = data.get("loss_scale_factor", cfg.loss_scale_factor)
 
         # Per-token log prob of the observed token at each position.
         new_log_probs = logprobs_from_logits_naive(logits, input_ids)
 
-        ratio = torch.exp(new_log_probs - old_log_probs)
-        clipped_ratio = torch.clamp(ratio, 1.0 - eps, 1.0 + eps)
+        neg_kl = torch.clamp(new_log_probs - old_log_probs, min=-20.0, max=20.0)
+        ratio = torch.exp(neg_kl)
+        clipped_ratio = torch.clamp(ratio, 1.0 - clip_low, 1.0 + clip_high)
 
+        # PPO-style surrogate loss.  Equivalent to
+        #   -adv * ratio  vs  -adv * clipped_ratio  -> torch.maximum
         surr1 = ratio * advantages
         surr2 = clipped_ratio * advantages
-        pg_loss = -torch.sum(torch.min(surr1, surr2) * response_mask) / (
-            response_mask.sum() + 1e-8
+        pg_losses = -torch.min(surr1, surr2)
+
+        pg_loss = agg_loss(
+            loss_mat=pg_losses,
+            loss_mask=response_mask,
+            loss_agg_mode=loss_agg_mode,
+            loss_scale_factor=loss_scale_factor,
         )
-        return {"loss": pg_loss, "metrics": {}}
+
+        with torch.no_grad():
+            approx_kl = torch.sum(-neg_kl * response_mask) / (response_mask.sum() + 1e-8)
+            clipped = (ratio < 1.0 - clip_low) | (ratio > 1.0 + clip_high)
+            clipfrac = torch.sum(clipped.float() * response_mask) / (response_mask.sum() + 1e-8)
+
+        return {
+            "loss": pg_loss,
+            "metrics": {
+                "approx_kl": approx_kl.item(),
+                "clipfrac": clipfrac.item(),
+            },
+        }
 
     def _choose_loss_fn(self, data: dict):
         """Pick loss function based on the data fields available."""

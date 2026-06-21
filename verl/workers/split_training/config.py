@@ -17,6 +17,15 @@ from typing import Any, Optional
 
 
 @dataclass
+class OverlongPenaltyConfig:
+    """DAPO-style overlong reward shaping config."""
+
+    enable: bool = False
+    buffer_len: int = 16
+    penalty_factor: float = 1.0
+
+
+@dataclass
 class SplitStageWorkerConfig:
     """Minimal config for a split training stage worker (B0).
 
@@ -39,6 +48,21 @@ class SplitStageWorkerConfig:
     lora_target_modules: list[str] = field(default_factory=lambda: ["q_proj", "v_proj"])
 
     stage_1_tp: int = 1  # Number of TP ranks for stage_1 (1=single rank, 2+=true TP)
+
+    # These are consumed by SplitStageWorker._grpo_loss; they can also be
+    # overridden per-batch via the data dict (e.g. data["clip_range_low"]).
+    norm_adv_by_std_in_grpo: bool = True  # False => Dr.GRPO
+    clip_range: float = 0.2  # default symmetric clip epsilon
+    clip_range_low: Optional[float] = None  # DAPO asymmetric lower clip
+    clip_range_high: Optional[float] = None  # DAPO asymmetric upper clip
+    loss_agg_mode: str = "token-mean"  # "seq-mean-token-sum" or "seq-mean-token-sum-norm"
+    loss_scale_factor: Optional[int] = None  # used by seq-mean-token-sum-norm
+
+    # DAPO overlong reward shaping (applied on the reward before advantage).
+    overlong_penalty: OverlongPenaltyConfig = field(
+        default_factory=lambda: OverlongPenaltyConfig(enable=False)
+    )
+    max_response_length: int = 256
 
     # Placeholders to stay compatible with the BaseEngine signature in the future.
     model_config: Optional[Any] = None

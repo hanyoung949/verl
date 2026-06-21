@@ -163,3 +163,40 @@ def merge_split_lora_state_dict(
             merged[global_key] = tensor
 
     return merged
+
+
+def apply_overlong_penalty(
+    rewards: torch.Tensor,
+    response_lengths: torch.Tensor,
+    max_response_length: int,
+    buffer_len: int = 16,
+    penalty_factor: float = 1.0,
+) -> torch.Tensor:
+    """Apply DAPO-style overlong reward shaping.
+
+    For each sample, if response length exceeds ``max_response_length - buffer_len``,
+    add a negative penalty proportional to the excess length:
+
+        penalty = min(-exceed_len / buffer_len * penalty_factor, 0)
+
+
+    Args:
+        rewards: (bsz,) tensor of raw outcome rewards.
+        response_lengths: (bsz,) tensor of actual response lengths.
+        max_response_length: Maximum desired response length (e.g. rollout max_new_tokens).
+        buffer_len: Length buffer before penalty kicks in.
+        penalty_factor: Slope of the penalty.
+
+    Returns:
+        (bsz,) tensor of shaped rewards (same dtype/device as input).
+    """
+    rewards = rewards.clone()
+    expected_len = max_response_length - buffer_len
+    if expected_len <= 0:
+        return rewards
+    exceed = (response_lengths - expected_len).clamp(min=0)
+    penalty = -(exceed.float() / buffer_len * penalty_factor).clamp(min=0)
+    # penalty is non-positive; only apply where there is actual response
+    valid = response_lengths > 0
+    rewards[valid] = rewards[valid] + penalty[valid].to(rewards.dtype)
+    return rewards

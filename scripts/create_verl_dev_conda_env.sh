@@ -4,7 +4,7 @@ set -euo pipefail
 # 这个脚本的目标很简单：
 # 1. 使用已经安装好的 Miniconda；
 # 2. 创建专用于当前仓库的 conda 环境 `verl`；
-# 3. 安装 split_demo 和一般 verl 开发所需的核心依赖；
+# 3. 安装一般 verl 开发所需的核心依赖；
 # 4. 将当前仓库以 editable 模式安装进去，便于边改边跑。
 
 CONDA_ROOT="${CONDA_ROOT:-/root/workspace/miniconda3}"
