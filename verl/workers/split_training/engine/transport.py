@@ -16,11 +16,16 @@
 
 from __future__ import annotations
 
+import time
 from typing import Optional
 
 import torch
 import torch.distributed as dist
 from torch import Tensor
+
+import logging
+
+logger = logging.getLogger(__name__)
 
 # Control flags
 FWD_ONLY = 0
@@ -50,11 +55,37 @@ class StageTransport:
         self.device = torch.device(device)
 
     def send(self, tensor: Tensor) -> None:
+        tensor_bytes = tensor.numel() * tensor.element_size()
+        t0 = time.perf_counter()
         dist.send(tensor.contiguous(), dst=self.remote_rank)
+        elapsed_ms = (time.perf_counter() - t0) * 1000
+        logger.info(
+            "STAGE_TRANSPORT send local_rank=%d remote_rank=%d "
+            "bytes=%d shape=%s dtype=%s time_ms=%.3f",
+            self.local_rank,
+            self.remote_rank,
+            tensor_bytes,
+            list(tensor.shape),
+            tensor.dtype,
+            elapsed_ms,
+        )
 
     def recv(self, shape, dtype):
         buf = torch.empty(shape, dtype=dtype, device=self.device)
+        t0 = time.perf_counter()
         dist.recv(buf, src=self.remote_rank)
+        elapsed_ms = (time.perf_counter() - t0) * 1000
+        tensor_bytes = buf.numel() * buf.element_size()
+        logger.info(
+            "STAGE_TRANSPORT recv local_rank=%d remote_rank=%d "
+            "bytes=%d shape=%s dtype=%s time_ms=%.3f",
+            self.local_rank,
+            self.remote_rank,
+            tensor_bytes,
+            list(buf.shape),
+            buf.dtype,
+            elapsed_ms,
+        )
         return buf
 
     def send_int(self, value: int) -> None:
