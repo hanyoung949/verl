@@ -16,6 +16,8 @@
 
 from __future__ import annotations
 
+import time
+
 import torch
 import torch.distributed as dist
 from torch import Tensor, nn
@@ -61,13 +63,35 @@ class Stage1:
             h = self._call_layer(layer, h, **kwargs)
         return h
 
-    def _recv_tensor(self, shape, dtype, src):
-        buf = torch.empty(shape, dtype=dtype, device=self.device)
-        dist.recv(buf, src=src)
-        return buf
+    def _recv_tensor(self, shape, dtype, src, label=""):
+        return self._timed_recv(shape, dtype, src, label=label)
 
-    def _send_tensor(self, tensor: Tensor, dst):
+    def _send_tensor(self, tensor: Tensor, dst, label=""):
+        self._timed_send(tensor, dst, label=label)
+
+    def _timed_send(self, tensor: Tensor, dst: int, label: str = "") -> None:
+        tensor_bytes = tensor.numel() * tensor.element_size()
+        t0 = time.perf_counter()
         dist.send(tensor.contiguous(), dst=dst)
+        elapsed_ms = (time.perf_counter() - t0) * 1000
+        print(
+            f"STAGE_TRANSPORT send src=? dst={dst} bytes={tensor_bytes} "
+            f"shape={list(tensor.shape)} dtype={tensor.dtype} label={label} time_ms={elapsed_ms:.3f}",
+            flush=True,
+        )
+
+    def _timed_recv(self, shape, dtype, src: int, label: str = ""):
+        buf = torch.empty(shape, dtype=dtype, device=self.device)
+        t0 = time.perf_counter()
+        dist.recv(buf, src=src)
+        elapsed_ms = (time.perf_counter() - t0) * 1000
+        tensor_bytes = buf.numel() * buf.element_size()
+        print(
+            f"STAGE_TRANSPORT recv dst=? src={src} bytes={tensor_bytes} "
+            f"shape={list(buf.shape)} dtype={buf.dtype} label={label} time_ms={elapsed_ms:.3f}",
+            flush=True,
+        )
+        return buf
 
     def _run_once_impl(self, topology, blocking_wait_for_header: bool):
         t = topology or {"stage_0": [0], "stage_1": [1], "stage_2": [2]}
@@ -76,8 +100,7 @@ class Stage1:
         send_rank = self.dst_rank if self.dst_rank is not None else t["stage_2"][0]
         _VALID_FLAGS = {FWD_ONLY, FWD_WITH_BWD, SHUTDOWN, PIPELINE_DONE}
 
-        header = torch.zeros(6, dtype=torch.int64, device=self.device)
-        dist.recv(header, src=recv_rank)
+        header = self._timed_recv((6,), torch.int64, recv_rank, label="header")
         flag = int(header[0].item())
 
         if flag not in _VALID_FLAGS:
@@ -90,17 +113,17 @@ class Stage1:
         if flag == SHUTDOWN:
             return False
 
-        dist.send(header.clone(), dst=send_rank)
+        self._timed_send(header.clone(), send_rank, label="header")
 
         if flag == PIPELINE_DONE:
             return True
 
         B, S, H, has_mask, dtype_code = [int(x) for x in header[1:].tolist()]
         tensor_dtype = _DTYPE_MAP[dtype_code]
-        h = self._recv_tensor((B, S, H), tensor_dtype, recv_rank)
-        pos_ids = self._recv_tensor((B, S), torch.int64, recv_rank)
+        h = self._recv_tensor((B, S, H), tensor_dtype, recv_rank, label="input_h")
+        pos_ids = self._recv_tensor((B, S), torch.int64, recv_rank, label="input_pos")
         if has_mask:
-            mask = self._recv_tensor((B, 1, S, S), tensor_dtype, recv_rank)
+            mask = self._recv_tensor((B, 1, S, S), tensor_dtype, recv_rank, label="input_mask")
         else:
             mask = None
 
@@ -125,8 +148,8 @@ class Stage1:
                     position_embeddings=pos_emb,
                     attention_mask=mask,
                 )
-            self._send_tensor(h_out, send_rank)
-            self._send_tensor(pos_ids, send_rank)
+            self._send_tensor(h_out, send_rank, label="output_h")
+            self._send_tensor(pos_ids, send_rank, label="output_pos")
 
         elif flag == FWD_WITH_BWD:
             h_in = h.detach().requires_grad_(True)
@@ -136,12 +159,12 @@ class Stage1:
                 position_embeddings=pos_emb,
                 attention_mask=mask,
             )
-            self._send_tensor(h_out.detach(), send_rank)
-            self._send_tensor(pos_ids, send_rank)
+            self._send_tensor(h_out.detach(), send_rank, label="output_h")
+            self._send_tensor(pos_ids, send_rank, label="output_pos")
 
-            grad_out = self._recv_tensor(h_out.shape, h_out.dtype, send_rank)
+            grad_out = self._recv_tensor(h_out.shape, h_out.dtype, send_rank, label="grad_out")
             torch.autograd.backward(h_out, grad_out)
-            self._send_tensor(h_in.grad, recv_rank)
+            self._send_tensor(h_in.grad, recv_rank, label="grad_input")
 
         return True
 

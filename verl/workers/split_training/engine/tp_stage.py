@@ -17,6 +17,8 @@ TP sharding convention (same as vLLM/Megatron):
 
 from __future__ import annotations
 
+import time
+
 import torch
 import torch.distributed as dist
 from torch import Tensor, nn
@@ -310,13 +312,37 @@ class TPMiddleStage:
             h = layer(h, **kwargs)
         return h
 
-    def _recv_tensor(self, shape, dtype, src):
-        buf = torch.empty(shape, dtype=dtype, device=self.device)
-        dist.recv(buf, src=src)
-        return buf
+    def _recv_tensor(self, shape, dtype, src, label=""):
+        return self._timed_recv(shape, dtype, src, label=label)
 
-    def _send_tensor(self, tensor: Tensor, dst):
+    def _send_tensor(self, tensor: Tensor, dst, label=""):
+        self._timed_send(tensor, dst, label=label)
+
+    def _timed_send(self, tensor: Tensor, dst: int, label: str = "") -> None:
+        my_rank = 1 + self.tp_rank
+        tensor_bytes = tensor.numel() * tensor.element_size()
+        t0 = time.perf_counter()
         dist.send(tensor.contiguous(), dst=dst)
+        elapsed_ms = (time.perf_counter() - t0) * 1000
+        print(
+            f"STAGE_TRANSPORT send src={my_rank} dst={dst} bytes={tensor_bytes} "
+            f"shape={list(tensor.shape)} dtype={tensor.dtype} label={label} time_ms={elapsed_ms:.3f}",
+            flush=True,
+        )
+
+    def _timed_recv(self, shape, dtype, src: int, label: str = ""):
+        my_rank = 1 + self.tp_rank
+        buf = torch.empty(shape, dtype=dtype, device=self.device)
+        t0 = time.perf_counter()
+        dist.recv(buf, src=src)
+        elapsed_ms = (time.perf_counter() - t0) * 1000
+        tensor_bytes = buf.numel() * buf.element_size()
+        print(
+            f"STAGE_TRANSPORT recv dst={my_rank} src={src} bytes={tensor_bytes} "
+            f"shape={list(buf.shape)} dtype={buf.dtype} label={label} time_ms={elapsed_ms:.3f}",
+            flush=True,
+        )
+        return buf
 
     def _get_pos_emb(self, h, pos_ids):
         if self.rotary_emb is not None:
@@ -345,23 +371,21 @@ class TPMiddleStage:
 
         # --- Header exchange ---
         if is_master:
-            header = torch.zeros(6, dtype=torch.int64, device=self.device)
-            dist.recv(header, src=stage_0_rank)
+            header = self._timed_recv((6,), torch.int64, stage_0_rank, label="header_stage0")
             flag = int(header[0].item())
             if flag not in _VALID_FLAGS:
                 raise RuntimeError(f"[TPStage1] illegal flag {flag}")
             for r in slave_ranks:
-                dist.send(header.clone(), dst=r)
+                self._timed_send(header.clone(), r, label="header_slave")
             if flag == SHUTDOWN:
                 return False
             if flag == PIPELINE_DONE:
-                dist.send(header.clone(), dst=stage_2_rank)
+                self._timed_send(header.clone(), stage_2_rank, label="header_stage2")
                 return True
-            dist.send(header.clone(), dst=stage_2_rank)
+            self._timed_send(header.clone(), stage_2_rank, label="header_stage2")
         else:
-            header = torch.zeros(6, dtype=torch.int64, device=self.device)
             master_rank = global_ranks[0]
-            dist.recv(header, src=master_rank)
+            header = self._timed_recv((6,), torch.int64, master_rank, label="header_master")
             flag = int(header[0].item())
             if flag == SHUTDOWN:
                 return False
@@ -373,19 +397,19 @@ class TPMiddleStage:
 
         # --- Receive/broadcast input ---
         if is_master:
-            h = self._recv_tensor((B, S, H), tensor_dtype, stage_0_rank)
-            pos_ids = self._recv_tensor((B, S), torch.int64, stage_0_rank)
-            mask = self._recv_tensor((B, 1, S, S), tensor_dtype, stage_0_rank) if has_mask else None
+            h = self._recv_tensor((B, S, H), tensor_dtype, stage_0_rank, label="input_h")
+            pos_ids = self._recv_tensor((B, S), torch.int64, stage_0_rank, label="input_pos")
+            mask = self._recv_tensor((B, 1, S, S), tensor_dtype, stage_0_rank, label="input_mask") if has_mask else None
             for r in slave_ranks:
-                dist.send(h.contiguous(), dst=r)
-                dist.send(pos_ids.contiguous(), dst=r)
+                self._timed_send(h, r, label="tp_broadcast_h")
+                self._timed_send(pos_ids, r, label="tp_broadcast_pos")
                 if mask is not None:
-                    dist.send(mask.contiguous(), dst=r)
+                    self._timed_send(mask, r, label="tp_broadcast_mask")
         else:
             master_rank = global_ranks[0]
-            h = self._recv_tensor((B, S, H), tensor_dtype, master_rank)
-            pos_ids = self._recv_tensor((B, S), torch.int64, master_rank)
-            mask = self._recv_tensor((B, 1, S, S), tensor_dtype, master_rank) if has_mask else None
+            h = self._recv_tensor((B, S, H), tensor_dtype, master_rank, label="tp_recv_h")
+            pos_ids = self._recv_tensor((B, S), torch.int64, master_rank, label="tp_recv_pos")
+            mask = self._recv_tensor((B, 1, S, S), tensor_dtype, master_rank, label="tp_recv_mask") if has_mask else None
 
         # --- Forward / backward ---
         if flag == FWD_ONLY:
@@ -393,8 +417,8 @@ class TPMiddleStage:
                 pos_emb = self._get_pos_emb(h, pos_ids)
                 h_out = self.forward(h, position_embeddings=pos_emb, attention_mask=mask)
             if is_master:
-                self._send_tensor(h_out, stage_2_rank)
-                self._send_tensor(pos_ids, stage_2_rank)
+                self._send_tensor(h_out, stage_2_rank, label="output_h")
+                self._send_tensor(pos_ids, stage_2_rank, label="output_pos")
 
         elif flag == FWD_WITH_BWD:
             h_in = h.detach().requires_grad_(True)
@@ -402,25 +426,25 @@ class TPMiddleStage:
             h_out = self.forward(h_in, position_embeddings=pos_emb, attention_mask=mask)
 
             if is_master:
-                self._send_tensor(h_out.detach(), stage_2_rank)
-                self._send_tensor(pos_ids, stage_2_rank)
+                self._send_tensor(h_out.detach(), stage_2_rank, label="output_h")
+                self._send_tensor(pos_ids, stage_2_rank, label="output_pos")
 
-                grad_out = self._recv_tensor(h_out.shape, h_out.dtype, stage_2_rank)
+                grad_out = self._recv_tensor(h_out.shape, h_out.dtype, stage_2_rank, label="grad_out")
                 for r in slave_ranks:
-                    dist.send(grad_out.contiguous(), dst=r)
+                    self._timed_send(grad_out, r, label="tp_broadcast_grad")
                 torch.autograd.backward(h_out, grad_out)
 
                 # Collect slave grad_inputs and merge
                 full_grad = h_in.grad.clone()
                 for r in slave_ranks:
-                    slave_grad = self._recv_tensor(h_in.grad.shape, h_in.grad.dtype, r)
+                    slave_grad = self._recv_tensor(h_in.grad.shape, h_in.grad.dtype, r, label="tp_slave_grad")
                     full_grad = full_grad + slave_grad
-                self._send_tensor(full_grad, stage_0_rank)
+                self._send_tensor(full_grad, stage_0_rank, label="grad_input")
             else:
                 master_rank = global_ranks[0]
-                grad_out = self._recv_tensor(h_out.shape, h_out.dtype, master_rank)
+                grad_out = self._recv_tensor(h_out.shape, h_out.dtype, master_rank, label="tp_recv_grad")
                 torch.autograd.backward(h_out, grad_out)
-                dist.send(h_in.grad.contiguous(), dst=master_rank)
+                self._timed_send(h_in.grad, master_rank, label="tp_slave_grad")
 
         return True
 

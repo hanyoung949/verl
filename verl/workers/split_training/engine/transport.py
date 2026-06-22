@@ -23,9 +23,6 @@ import torch
 import torch.distributed as dist
 from torch import Tensor
 
-import logging
-
-logger = logging.getLogger(__name__)
 
 # Control flags
 FWD_ONLY = 0
@@ -59,15 +56,10 @@ class StageTransport:
         t0 = time.perf_counter()
         dist.send(tensor.contiguous(), dst=self.remote_rank)
         elapsed_ms = (time.perf_counter() - t0) * 1000
-        logger.info(
-            "STAGE_TRANSPORT send local_rank=%d remote_rank=%d "
-            "bytes=%d shape=%s dtype=%s time_ms=%.3f",
-            self.local_rank,
-            self.remote_rank,
-            tensor_bytes,
-            list(tensor.shape),
-            tensor.dtype,
-            elapsed_ms,
+        print(
+            f"STAGE_TRANSPORT send local_rank={self.local_rank} remote_rank={self.remote_rank} "
+            f"bytes={tensor_bytes} shape={list(tensor.shape)} dtype={tensor.dtype} time_ms={elapsed_ms:.3f}",
+            flush=True,
         )
 
     def recv(self, shape, dtype):
@@ -76,15 +68,10 @@ class StageTransport:
         dist.recv(buf, src=self.remote_rank)
         elapsed_ms = (time.perf_counter() - t0) * 1000
         tensor_bytes = buf.numel() * buf.element_size()
-        logger.info(
-            "STAGE_TRANSPORT recv local_rank=%d remote_rank=%d "
-            "bytes=%d shape=%s dtype=%s time_ms=%.3f",
-            self.local_rank,
-            self.remote_rank,
-            tensor_bytes,
-            list(buf.shape),
-            buf.dtype,
-            elapsed_ms,
+        print(
+            f"STAGE_TRANSPORT recv local_rank={self.local_rank} remote_rank={self.remote_rank} "
+            f"bytes={tensor_bytes} shape={list(buf.shape)} dtype={buf.dtype} time_ms={elapsed_ms:.3f}",
+            flush=True,
         )
         return buf
 
