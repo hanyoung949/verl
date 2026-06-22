@@ -321,8 +321,10 @@ class TPMiddleStage:
     def _timed_send(self, tensor: Tensor, dst: int, label: str = "") -> None:
         my_rank = 1 + self.tp_rank
         tensor_bytes = tensor.numel() * tensor.element_size()
+        torch.cuda.synchronize(self.device)
         t0 = time.perf_counter()
         dist.send(tensor.contiguous(), dst=dst)
+        torch.cuda.synchronize(self.device)
         elapsed_ms = (time.perf_counter() - t0) * 1000
         print(
             f"STAGE_TRANSPORT send src={my_rank} dst={dst} bytes={tensor_bytes} "
@@ -333,8 +335,10 @@ class TPMiddleStage:
     def _timed_recv(self, shape, dtype, src: int, label: str = ""):
         my_rank = 1 + self.tp_rank
         buf = torch.empty(shape, dtype=dtype, device=self.device)
+        torch.cuda.synchronize(self.device)
         t0 = time.perf_counter()
         dist.recv(buf, src=src)
+        torch.cuda.synchronize(self.device)
         elapsed_ms = (time.perf_counter() - t0) * 1000
         tensor_bytes = buf.numel() * buf.element_size()
         print(

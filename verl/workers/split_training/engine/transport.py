@@ -53,8 +53,10 @@ class StageTransport:
 
     def send(self, tensor: Tensor) -> None:
         tensor_bytes = tensor.numel() * tensor.element_size()
+        torch.cuda.synchronize(self.device)
         t0 = time.perf_counter()
         dist.send(tensor.contiguous(), dst=self.remote_rank)
+        torch.cuda.synchronize(self.device)
         elapsed_ms = (time.perf_counter() - t0) * 1000
         print(
             f"STAGE_TRANSPORT send local_rank={self.local_rank} remote_rank={self.remote_rank} "
@@ -64,8 +66,10 @@ class StageTransport:
 
     def recv(self, shape, dtype):
         buf = torch.empty(shape, dtype=dtype, device=self.device)
+        torch.cuda.synchronize(self.device)
         t0 = time.perf_counter()
         dist.recv(buf, src=self.remote_rank)
+        torch.cuda.synchronize(self.device)
         elapsed_ms = (time.perf_counter() - t0) * 1000
         tensor_bytes = buf.numel() * buf.element_size()
         print(
