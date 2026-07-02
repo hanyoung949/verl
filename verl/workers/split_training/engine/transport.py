@@ -23,6 +23,10 @@ import torch
 import torch.distributed as dist
 from torch import Tensor
 
+from verl.utils.split_trace import get_split_trace_logger
+
+_TRACE = get_split_trace_logger("train_transport")
+
 
 # Control flags
 FWD_ONLY = 0
@@ -52,11 +56,13 @@ class StageTransport:
         self.device = torch.device(device)
 
     def send(self, tensor: Tensor) -> None:
-        tensor_bytes = tensor.numel() * tensor.element_size()
+        tensor_bytes = int(tensor.numel() * tensor.element_size())
+        _TRACE.log(phase="stage_p2p_send", event="start", bytes_=tensor_bytes)
         torch.cuda.synchronize(self.device)
         t0 = time.perf_counter()
         dist.send(tensor.contiguous(), dst=self.remote_rank)
         torch.cuda.synchronize(self.device)
+        _TRACE.log(phase="stage_p2p_send", event="end", bytes_=tensor_bytes)
         elapsed_ms = (time.perf_counter() - t0) * 1000
         print(
             f"STAGE_TRANSPORT send local_rank={self.local_rank} remote_rank={self.remote_rank} "
@@ -65,11 +71,14 @@ class StageTransport:
         )
 
     def recv(self, shape, dtype):
+        _TRACE.log(phase="stage_p2p_recv", event="start")
         buf = torch.empty(shape, dtype=dtype, device=self.device)
         torch.cuda.synchronize(self.device)
         t0 = time.perf_counter()
         dist.recv(buf, src=self.remote_rank)
         torch.cuda.synchronize(self.device)
+        _TRACE.log(phase="stage_p2p_recv", event="end",
+                   bytes_=int(buf.numel() * buf.element_size()))
         elapsed_ms = (time.perf_counter() - t0) * 1000
         tensor_bytes = buf.numel() * buf.element_size()
         print(

@@ -26,6 +26,9 @@ import torch.nn.functional as F
 from transformers.models.llama.modeling_llama import apply_rotary_pos_emb, repeat_kv
 
 from .transport import FWD_ONLY, FWD_WITH_BWD, SHUTDOWN, PIPELINE_DONE, _DTYPE_MAP
+from verl.utils.split_trace import get_split_trace_logger
+
+_TRACE = get_split_trace_logger("train_tp")
 
 
 # ---------------------------------------------------------------------------
@@ -320,11 +323,13 @@ class TPMiddleStage:
 
     def _timed_send(self, tensor: Tensor, dst: int, label: str = "") -> None:
         my_rank = 1 + self.tp_rank
-        tensor_bytes = tensor.numel() * tensor.element_size()
+        tensor_bytes = int(tensor.numel() * tensor.element_size())
+        _TRACE.log(phase="stage_1_p2p_send", event="start", bytes_=tensor_bytes, extra={"label": label})
         torch.cuda.synchronize(self.device)
         t0 = time.perf_counter()
         dist.send(tensor.contiguous(), dst=dst)
         torch.cuda.synchronize(self.device)
+        _TRACE.log(phase="stage_1_p2p_send", event="end", bytes_=tensor_bytes, extra={"label": label})
         elapsed_ms = (time.perf_counter() - t0) * 1000
         print(
             f"STAGE_TRANSPORT send src={my_rank} dst={dst} bytes={tensor_bytes} "
@@ -334,13 +339,15 @@ class TPMiddleStage:
 
     def _timed_recv(self, shape, dtype, src: int, label: str = ""):
         my_rank = 1 + self.tp_rank
+        _TRACE.log(phase="stage_1_p2p_recv", event="start", extra={"label": label})
         buf = torch.empty(shape, dtype=dtype, device=self.device)
         torch.cuda.synchronize(self.device)
         t0 = time.perf_counter()
         dist.recv(buf, src=src)
         torch.cuda.synchronize(self.device)
+        tensor_bytes = int(buf.numel() * buf.element_size())
+        _TRACE.log(phase="stage_1_p2p_recv", event="end", bytes_=tensor_bytes, extra={"label": label})
         elapsed_ms = (time.perf_counter() - t0) * 1000
-        tensor_bytes = buf.numel() * buf.element_size()
         print(
             f"STAGE_TRANSPORT recv dst={my_rank} src={src} bytes={tensor_bytes} "
             f"shape={list(buf.shape)} dtype={buf.dtype} label={label} time_ms={elapsed_ms:.3f}",
@@ -416,39 +423,40 @@ class TPMiddleStage:
             mask = self._recv_tensor((B, 1, S, S), tensor_dtype, master_rank, label="tp_recv_mask") if has_mask else None
 
         # --- Forward / backward ---
-        if flag == FWD_ONLY:
-            with torch.no_grad():
-                pos_emb = self._get_pos_emb(h, pos_ids)
-                h_out = self.forward(h, position_embeddings=pos_emb, attention_mask=mask)
-            if is_master:
-                self._send_tensor(h_out, stage_2_rank, label="output_h")
-                self._send_tensor(pos_ids, stage_2_rank, label="output_pos")
+        with _TRACE.trace("stage_1_compute", extra={"flag": flag}):
+            if flag == FWD_ONLY:
+                with torch.no_grad():
+                    pos_emb = self._get_pos_emb(h, pos_ids)
+                    h_out = self.forward(h, position_embeddings=pos_emb, attention_mask=mask)
+                if is_master:
+                    self._send_tensor(h_out, stage_2_rank, label="output_h")
+                    self._send_tensor(pos_ids, stage_2_rank, label="output_pos")
 
-        elif flag == FWD_WITH_BWD:
-            h_in = h.detach().requires_grad_(True)
-            pos_emb = self._get_pos_emb(h_in, pos_ids)
-            h_out = self.forward(h_in, position_embeddings=pos_emb, attention_mask=mask)
+            elif flag == FWD_WITH_BWD:
+                h_in = h.detach().requires_grad_(True)
+                pos_emb = self._get_pos_emb(h_in, pos_ids)
+                h_out = self.forward(h_in, position_embeddings=pos_emb, attention_mask=mask)
 
-            if is_master:
-                self._send_tensor(h_out.detach(), stage_2_rank, label="output_h")
-                self._send_tensor(pos_ids, stage_2_rank, label="output_pos")
+                if is_master:
+                    self._send_tensor(h_out.detach(), stage_2_rank, label="output_h")
+                    self._send_tensor(pos_ids, stage_2_rank, label="output_pos")
 
-                grad_out = self._recv_tensor(h_out.shape, h_out.dtype, stage_2_rank, label="grad_out")
-                for r in slave_ranks:
-                    self._timed_send(grad_out, r, label="tp_broadcast_grad")
-                torch.autograd.backward(h_out, grad_out)
+                    grad_out = self._recv_tensor(h_out.shape, h_out.dtype, stage_2_rank, label="grad_out")
+                    for r in slave_ranks:
+                        self._timed_send(grad_out, r, label="tp_broadcast_grad")
+                    torch.autograd.backward(h_out, grad_out)
 
-                # Collect slave grad_inputs and merge
-                full_grad = h_in.grad.clone()
-                for r in slave_ranks:
-                    slave_grad = self._recv_tensor(h_in.grad.shape, h_in.grad.dtype, r, label="tp_slave_grad")
-                    full_grad = full_grad + slave_grad
-                self._send_tensor(full_grad, stage_0_rank, label="grad_input")
-            else:
-                master_rank = global_ranks[0]
-                grad_out = self._recv_tensor(h_out.shape, h_out.dtype, master_rank, label="tp_recv_grad")
-                torch.autograd.backward(h_out, grad_out)
-                self._timed_send(h_in.grad, master_rank, label="tp_slave_grad")
+                    # Collect slave grad_inputs and merge
+                    full_grad = h_in.grad.clone()
+                    for r in slave_ranks:
+                        slave_grad = self._recv_tensor(h_in.grad.shape, h_in.grad.dtype, r, label="tp_slave_grad")
+                        full_grad = full_grad + slave_grad
+                    self._send_tensor(full_grad, stage_0_rank, label="grad_input")
+                else:
+                    master_rank = global_ranks[0]
+                    grad_out = self._recv_tensor(h_out.shape, h_out.dtype, master_rank, label="tp_recv_grad")
+                    torch.autograd.backward(h_out, grad_out)
+                    self._timed_send(h_in.grad, master_rank, label="tp_slave_grad")
 
         return True
 

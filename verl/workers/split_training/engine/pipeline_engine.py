@@ -30,6 +30,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from verl.workers.engine.base import BaseEngine, EngineRegistry
 from verl.utils.torch_functional import logprobs_from_logits
+from verl.utils.split_trace import get_split_trace_logger
 
 from ..split_utils import compute_split_layer_ranges
 from .middle_stage import Stage1
@@ -65,6 +66,13 @@ class SplitTrainingEngine(BaseEngine):
         self.stage = None
         self.topology = topology or {"stage_0": [0], "stage_1": [1], "stage_2": [2]}
         self._resolve_stage()
+        if self.is_stage_0:
+            os.environ["SPLIT_STAGE"] = "stage_0"
+        elif self.is_stage_1:
+            os.environ["SPLIT_STAGE"] = "stage_1"
+        else:
+            os.environ["SPLIT_STAGE"] = "stage_2"
+        self._trace = get_split_trace_logger("train_engine")
         self._parse_config()
 
     def _resolve_stage(self):
@@ -224,6 +232,10 @@ class SplitTrainingEngine(BaseEngine):
             return self._stage_2_forward_backward(data, loss_function, forward_only)
 
     def _stage_0_forward_backward(self, data, loss_function, forward_only):
+        with self._trace.trace("stage_0_compute", extra={"forward_only": forward_only}):
+            return self._stage_0_forward_backward_impl(data, loss_function, forward_only)
+
+    def _stage_0_forward_backward_impl(self, data, loss_function, forward_only):
         input_ids = data["input_ids"]
         attention_mask = data.get("attention_mask", torch.ones_like(input_ids))
 
@@ -260,6 +272,10 @@ class SplitTrainingEngine(BaseEngine):
         return {}
 
     def _stage_2_forward_backward(self, data, loss_function, forward_only):
+        with self._trace.trace("stage_2_compute", extra={"forward_only": forward_only}):
+            return self._stage_2_forward_backward_impl(data, loss_function, forward_only)
+
+    def _stage_2_forward_backward_impl(self, data, loss_function, forward_only):
         header = torch.zeros(6, dtype=torch.int64, device="cuda")
         dist.recv(header, src=self.stage_1_inter_stage_rank)
         flag = int(header[0].item())

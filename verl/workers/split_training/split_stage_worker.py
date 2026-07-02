@@ -23,6 +23,7 @@ from verl.single_controller.base import Worker
 from verl.utils.distributed import initialize_global_process_group
 from verl.trainer.ppo.core_algos import agg_loss
 from verl.utils.torch_functional import logprobs_from_logits_naive
+from verl.utils.split_trace import get_split_trace_logger
 
 
 class SplitStageWorker(Worker):
@@ -53,28 +54,39 @@ class SplitStageWorker(Worker):
         else:
             topology = {"stage_0": [0], "stage_1": [1], "stage_2": [2]}
 
-        self.engine = SplitTrainingEngine(
-            model_config=config.model_config,
-            engine_config=config.engine_config,
-            optimizer_config=config.optimizer_config,
-            checkpoint_config=config.checkpoint_config,
-            topology=topology,
-        )
+        # Determine stage from topology for trace logging
+        if self._rank in topology["stage_0"]:
+            os.environ["SPLIT_STAGE"] = "stage_0"
+        elif self._rank in topology["stage_1"]:
+            os.environ["SPLIT_STAGE"] = "stage_1"
+        else:
+            os.environ["SPLIT_STAGE"] = "stage_2"
+        self._trace = get_split_trace_logger("train")
+        self._train_micro_step = 0
 
-        # Override defaults from the prototype before initialize() loads weights.
-        self.engine.model_path = config.model_path
-        self.engine.split_stage_0_size = config.split_stage_0_size
-        self.engine.split_stage_2_size = config.split_stage_2_size
-        self.engine.lr = config.lr
-        self.engine.clip_grad = config.clip_grad
-        self.engine.lora_r = config.lora_r
-        self.engine.lora_alpha = config.lora_alpha
-        self.engine.lora_dropout = config.lora_dropout
-        self.engine.lora_target_modules = config.lora_target_modules
+        with self._trace.trace("worker_init"):
+            self.engine = SplitTrainingEngine(
+                model_config=config.model_config,
+                engine_config=config.engine_config,
+                optimizer_config=config.optimizer_config,
+                checkpoint_config=config.checkpoint_config,
+                topology=topology,
+            )
 
-        self.engine.initialize()
-        self.is_head = self.engine.is_head
-        self.is_tail = self.engine.is_tail
+            # Override defaults from the prototype before initialize() loads weights.
+            self.engine.model_path = config.model_path
+            self.engine.split_stage_0_size = config.split_stage_0_size
+            self.engine.split_stage_2_size = config.split_stage_2_size
+            self.engine.lr = config.lr
+            self.engine.clip_grad = config.clip_grad
+            self.engine.lora_r = config.lora_r
+            self.engine.lora_alpha = config.lora_alpha
+            self.engine.lora_dropout = config.lora_dropout
+            self.engine.lora_target_modules = config.lora_target_modules
+
+            self.engine.initialize()
+            self.is_head = self.engine.is_head
+            self.is_tail = self.engine.is_tail
 
     @staticmethod
     def _lm_loss(logits: torch.Tensor, data: dict) -> dict[str, Any]:
@@ -175,15 +187,16 @@ class SplitStageWorker(Worker):
         world_size = dist.get_world_size()
         print(f"[rank{rank}] reset start, world_size={world_size}", flush=True)
 
-        # Warm up CUDA context before barrier
-        _ = torch.zeros(1, device="cuda")
-        print(f"[rank{rank}] cuda context ready {time.time()-t0:.1f}s", flush=True)
+        with self._trace.trace("worker_reset"):
+            # Warm up CUDA context before barrier
+            _ = torch.zeros(1, device="cuda")
+            print(f"[rank{rank}] cuda context ready {time.time()-t0:.1f}s", flush=True)
 
-        dist.barrier()
-        print(f"[rank{rank}] barrier done {time.time()-t0:.1f}s", flush=True)
+            dist.barrier()
+            print(f"[rank{rank}] barrier done {time.time()-t0:.1f}s", flush=True)
 
-        self.engine.initialize()
-        print(f"[rank{rank}] engine.initialize done {time.time()-t0:.1f}s", flush=True)
+            self.engine.initialize()
+            print(f"[rank{rank}] engine.initialize done {time.time()-t0:.1f}s", flush=True)
         return {"rank": self._rank, "stage": "head" if self.is_head else "tail"}
 
     def train_micro_batch(self, data: dict) -> dict:
@@ -193,7 +206,9 @@ class SplitStageWorker(Worker):
         progress, because this method blocks on NCCL send/recv with rank 1.
         """
         loss_fn = self._choose_loss_fn(data)
-        outputs = self.engine.train_batch(data, loss_fn)
+        self._train_micro_step += 1
+        with self._trace.trace("train_micro_batch", micro_step=self._train_micro_step):
+            outputs = self.engine.train_batch(data, loss_fn)
         return outputs
 
     def infer_micro_batch(self, data: dict) -> dict:
