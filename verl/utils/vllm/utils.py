@@ -78,7 +78,13 @@ class VLLMHijack:
                 model = self._adapter_manager.model
                 hf_to_vllm_mapper = None
                 if hasattr(model, "hf_to_vllm_mapper") and model.hf_to_vllm_mapper is not None:
-                    hf_to_vllm_mapper = model.hf_to_vllm_mapper
+                    # Use the unstacked mapper so that LoRA weight names keep
+                    # their constituent names (e.g. q_proj/v_proj) instead of
+                    # being rewritten to vLLM's packed names (e.g. qkv_proj).
+                    mapper = model.hf_to_vllm_mapper
+                    hf_to_vllm_mapper = getattr(
+                        mapper, "get_unstacked_mapper", lambda: mapper
+                    )()
 
                 lora_request_kwargs = {
                     "peft_helper": peft_helper,

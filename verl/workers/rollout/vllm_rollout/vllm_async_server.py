@@ -1141,8 +1141,9 @@ class vLLMReplica(RolloutReplica):
                         # https://docs.vllm.ai/en/latest/usage/troubleshooting.html?h=nccl_cumem_enable#known-issues
                         # https://github.com/vllm-project/vllm/blob/c6b0a7d3ba03ca414be1174e9bd86a97191b7090/vllm/worker/worker_base.py#L445
                         "NCCL_CUMEM_ENABLE": "0",
-                        # Propagate split-related env vars from driver to vLLM server actors.
-                        # VLLM_USE_V2_MODEL_RUNNER=0 is required for the current layer-wise split impl.
+                        # Propagate split-related env vars and the V2 model runner flag from
+                        # driver to vLLM server actors. V2 is the default for layer-wise split;
+                        # set VLLM_USE_V2_MODEL_RUNNER=0 to force the legacy V1 runner.
                         **{k: v for k, v in os.environ.items() if k.startswith("VLLM_SPLIT_") or k == "VLLM_USE_V2_MODEL_RUNNER"},
                         # NCCL network env vars may also be required for cross-node split.
                         **{k: os.environ[k] for k in [
