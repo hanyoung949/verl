@@ -16,6 +16,7 @@ import json
 import logging
 import os
 import platform
+import re
 import signal
 import threading
 from types import MethodType
@@ -347,6 +348,457 @@ class vLLMColocateWorkerExtension:
         except Exception as e:
             logger.warning("read_lora_weight_norms failed: %s", e)
         return result
+
+    # ------------------------------------------------------------------
+    # DVI L0 telemetry lifecycle
+    # ------------------------------------------------------------------
+    _DVI_DEFAULT_QUOTA_BYTES = 10 * 1024**3  # 10 GiB
+    _DVI_STAGE0_QUOTA_PERCENT = 90
+
+    @classmethod
+    def _dvi_side_quota(cls, total_bytes: int, *, stage0: bool) -> int:
+        """Split one run-level quota between the two independent spools."""
+        if total_bytes < 2:
+            raise ValueError("DVI quota_bytes must be at least 2")
+        stage0_bytes = total_bytes * cls._DVI_STAGE0_QUOTA_PERCENT // 100
+        stage0_bytes = max(1, min(stage0_bytes, total_bytes - 1))
+        if stage0:
+            return stage0_bytes
+        return total_bytes - stage0_bytes
+
+    @staticmethod
+    def _dvi_capture_dtype(
+        spool_metadata: dict[str, Any],
+        runner_dtype: Any,
+    ) -> torch.dtype | None:
+        """Resolve and persist the stage-0 capture dtype for both spools."""
+        configured = spool_metadata.get("capture_dtype")
+        if configured is None:
+            if not isinstance(runner_dtype, torch.dtype):
+                return None
+            dtype = runner_dtype
+        elif isinstance(configured, torch.dtype):
+            dtype = configured
+        else:
+            dtype_name = str(configured).removeprefix("torch.")
+            dtype = getattr(torch, dtype_name, None)
+            if not isinstance(dtype, torch.dtype):
+                raise ValueError(
+                    f"Unsupported DVI capture_dtype: {configured!r}"
+                )
+        spool_metadata["capture_dtype"] = str(dtype).removeprefix("torch.")
+        return dtype
+
+    def _is_dvi_stage0_capture_owner(self, model_runner: Any) -> bool:
+        """Return True if this worker owns the stage-0 hidden spool writer.
+
+        Owner is the first PP-rank worker with tensor-parallel rank 0
+        (fail-closed, same rule as the stage-2 owner check).
+        """
+        if model_runner is None:
+            return False
+        if not getattr(model_runner, "is_first_pp_rank", False):
+            return False
+        try:
+            from vllm.distributed.parallel_state import (
+                get_tensor_model_parallel_rank,
+            )
+
+            return get_tensor_model_parallel_rank() == 0
+        except Exception:
+            return False
+
+    def _is_dvi_capture_owner(self, model_runner: Any) -> bool:
+        """Return True if this worker should own the stage-2 spool writer.
+
+        Owner is the last PP-rank worker with tensor-parallel rank 0. This
+        avoids multiple workers writing to the same spool directory. The check
+        is fail-closed: if we cannot positively confirm rank 0, we return
+        ``False`` so the session is safe even when distributed state is in an
+        unexpected state.
+        """
+        if model_runner is None:
+            return False
+        if not getattr(model_runner, "is_last_pp_rank", False):
+            return False
+        try:
+            from vllm.distributed.parallel_state import (
+                get_tensor_model_parallel_rank,
+            )
+
+            return get_tensor_model_parallel_rank() == 0
+        except Exception:
+            # Cannot confirm rank; fail-closed rather than risk multiple owners.
+            return False
+
+    def _start_dvi_stage0_side(
+        self,
+        spool_dir: str,
+        spool_metadata: dict[str, Any],
+        sampling_config: dict[str, Any],
+    ) -> None:
+        """Create the stage_0 hidden writer/producer/probe on this worker.
+
+        Uses a sibling spool dir (``<spool_dir>-stage0``): the offline merger
+        expects separate stage_0/stage_2 spool directories, and two writers
+        must not share a spool manifest.  The sampling config is identical on
+        both sides so both stages reserve the same deterministic position set.
+        Transactional like the stage_2 setup: on failure the writer is closed
+        and references cleared.
+        """
+        from pathlib import Path
+
+        from vllm.v1.worker.gpu.split_dvi.hooks import DVIStage0TelemetryProbe
+        from vllm.v1.worker.gpu.split_dvi.telemetry import (
+            DVIAsyncTensorHandoff,
+            DVIPartialSpoolWriter,
+            DVISamplingConfig,
+            DVIStage0TelemetryProducer,
+            DVITensorSpec,
+        )
+
+        model_runner = getattr(self, "model_runner", None)
+        merged_metadata = dict(spool_metadata)
+        merged_metadata["sampling_config"] = dict(sampling_config)
+        runner_dtype = getattr(model_runner, "dtype", None)
+        capture_dtype = self._dvi_capture_dtype(merged_metadata, runner_dtype)
+        total_quota_bytes = int(
+            merged_metadata.get("quota_bytes", self._DVI_DEFAULT_QUOTA_BYTES)
+        )
+        quota_bytes = self._dvi_side_quota(total_quota_bytes, stage0=True)
+        stage0_dir = Path(spool_dir).with_name(Path(spool_dir).name + "-stage0")
+        writer = DVIPartialSpoolWriter(
+            spool_dir=stage0_dir,
+            spool_metadata=merged_metadata,
+            quota_bytes=quota_bytes,
+        )
+        try:
+            cfg = DVISamplingConfig(
+                sample_rate=float(sampling_config["sample_rate"]),
+                max_per_request=int(sampling_config["max_per_request"]),
+                seed=int(sampling_config["seed"]),
+                top_k=int(sampling_config.get("top_k", 8)),
+            )
+            handoff = None
+            device = getattr(model_runner, "device", None)
+            hidden_size = None
+            model_config = getattr(model_runner, "model_config", None)
+            if model_config is not None and hasattr(
+                model_config, "get_hidden_size"
+            ):
+                value = model_config.get_hidden_size()
+                if type(value) is int:
+                    hidden_size = value
+            if (
+                isinstance(device, torch.device)
+                and device.type == "cuda"
+                and hidden_size is not None
+            ):
+                if capture_dtype is None:
+                    raise ValueError("CUDA DVI capture requires a concrete dtype")
+                handoff = DVIAsyncTensorHandoff(
+                    {"hidden": DVITensorSpec((hidden_size,), capture_dtype)},
+                    pool_size=int(merged_metadata.get("handoff_pool_size", 64)),
+                )
+            producer = DVIStage0TelemetryProducer(writer, cfg, handoff=handoff)
+            probe = DVIStage0TelemetryProbe(producer, enabled=True)
+
+            self._dvi_stage0_writer: Any = writer
+            self._dvi_stage0_producer: Any = producer
+            self._dvi_stage0_probe: Any = probe
+            if model_runner is not None and hasattr(
+                model_runner, "set_dvi_stage0_probe"
+            ):
+                model_runner.set_dvi_stage0_probe(probe)
+        except Exception:
+            producer = locals().get("producer")
+            handoff = locals().get("handoff")
+            try:
+                if producer is not None:
+                    producer.close()
+                elif handoff is not None:
+                    handoff.close()
+            except Exception:
+                pass
+            try:
+                writer.close()
+            except Exception:
+                pass
+            self._dvi_stage0_writer = None
+            self._dvi_stage0_producer = None
+            self._dvi_stage0_probe = None
+            if model_runner is not None and hasattr(
+                model_runner, "set_dvi_stage0_probe"
+            ):
+                model_runner.set_dvi_stage0_probe(None)
+            raise
+
+    def start_dvi_session(
+        self,
+        spool_dir: str,
+        spool_metadata: dict[str, Any],
+        sampling_config: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Start a new stage-2 DVI telemetry session on this worker.
+
+        Each rollout should use its own spool directory. Calling this while a
+        session already exists will close the previous session first.
+
+        Only the designated capture-owner worker creates a writer; other workers
+        disable telemetry locally. The driver should pass a per-server unique
+        ``spool_dir`` (or root) to avoid conflicts across server actors.
+
+        The start is transactional: if hook/producer initialization fails after
+        the writer is created, the writer is closed and all references are
+        cleared before re-raising.
+
+        Returns:
+            ``{"owner": True, "spool_dir": str}`` if this worker owns the
+            writer, or ``{"owner": False}`` otherwise.
+        """
+        self.close_dvi_session()
+
+        model_runner = getattr(self, "model_runner", None)
+
+        # stage_0 hidden side: independent owner on the first PP rank; shares
+        # the same spool dir and sampling config so both stages finalize to
+        # identical deterministic sample sets.
+        stage0_owner = self._is_dvi_stage0_capture_owner(model_runner)
+        if stage0_owner:
+            self._start_dvi_stage0_side(spool_dir, spool_metadata, sampling_config)
+        elif model_runner is not None and hasattr(
+            model_runner, "set_dvi_stage0_probe"
+        ):
+            model_runner.set_dvi_stage0_probe(None)
+
+        if not self._is_dvi_capture_owner(model_runner):
+            if model_runner is not None and hasattr(
+                model_runner, "set_dvi_telemetry_hook"
+            ):
+                model_runner.set_dvi_telemetry_hook(None)
+            if stage0_owner:
+                return {"owner": False, "stage0_owner": True}
+            return {"owner": False}
+
+        from pathlib import Path
+
+        from vllm.v1.worker.gpu.split_dvi.hooks import DVIStage2TelemetryHook
+        from vllm.v1.worker.gpu.split_dvi.telemetry import (
+            DVIAsyncTensorHandoff,
+            DVIPartialSpoolWriter,
+            DVISamplingConfig,
+            DVIStage2TelemetryProducer,
+            DVITensorSpec,
+        )
+
+        merged_metadata = dict(spool_metadata)
+        merged_metadata["sampling_config"] = dict(sampling_config)
+        runner_dtype = getattr(model_runner, "dtype", None)
+        self._dvi_capture_dtype(merged_metadata, runner_dtype)
+
+        total_quota_bytes = int(
+            merged_metadata.get("quota_bytes", self._DVI_DEFAULT_QUOTA_BYTES)
+        )
+        quota_bytes = self._dvi_side_quota(total_quota_bytes, stage0=False)
+        writer = DVIPartialSpoolWriter(
+            spool_dir=Path(spool_dir),
+            spool_metadata=merged_metadata,
+            quota_bytes=quota_bytes,
+        )
+
+        try:
+            cfg = DVISamplingConfig(
+                sample_rate=float(sampling_config["sample_rate"]),
+                max_per_request=int(sampling_config["max_per_request"]),
+                seed=int(sampling_config["seed"]),
+                top_k=int(sampling_config.get("top_k", 8)),
+            )
+            handoff = None
+            device = getattr(model_runner, "device", None)
+            if isinstance(device, torch.device) and device.type == "cuda":
+                top_k = cfg.top_k
+                specs = {
+                    "topk_ids": DVITensorSpec((top_k,), torch.int32),
+                    "topk_logprobs": DVITensorSpec((top_k,), torch.float32),
+                    "residual_mass": DVITensorSpec((), torch.float32),
+                    "top1_id": DVITensorSpec((), torch.int32),
+                    "valid_count": DVITensorSpec((), torch.int32),
+                }
+                handoff = DVIAsyncTensorHandoff(
+                    specs,
+                    pool_size=int(merged_metadata.get("handoff_pool_size", 64)),
+                )
+            producer = DVIStage2TelemetryProducer(writer, cfg, handoff=handoff)
+            hook = DVIStage2TelemetryHook(producer, enabled=True)
+
+            self._dvi_writer: Any = writer
+            self._dvi_stage2_producer: Any = producer
+            self._dvi_hook: Any = hook
+            self._dvi_finalize_no_match_count = 0
+            self._dvi_finalize_ambiguous_count = 0
+
+            if model_runner is not None and hasattr(
+                model_runner, "set_dvi_telemetry_hook"
+            ):
+                model_runner.set_dvi_telemetry_hook(hook)
+        except Exception:
+            # Roll back the writer thread and references on any failure.
+            producer = locals().get("producer")
+            handoff = locals().get("handoff")
+            try:
+                if producer is not None:
+                    producer.close()
+                elif handoff is not None:
+                    handoff.close()
+            except Exception:
+                pass
+            try:
+                writer.close()
+            except Exception:
+                pass
+            self._dvi_writer = None
+            self._dvi_stage2_producer = None
+            self._dvi_hook = None
+            self._dvi_finalize_no_match_count = 0
+            self._dvi_finalize_ambiguous_count = 0
+            if model_runner is not None and hasattr(
+                model_runner, "set_dvi_telemetry_hook"
+            ):
+                model_runner.set_dvi_telemetry_hook(None)
+            raise
+
+        return {
+            "owner": True,
+            "spool_dir": str(spool_dir),
+            "stage0_owner": stage0_owner,
+        }
+
+    def finalize_dvi_request(
+        self,
+        request_id: str,
+        prompt_token_ids: list[int],
+        response_token_ids: list[int],
+    ) -> None:
+        """Finalize a request in the active stage-2 DVI session.
+
+        vLLM randomizes internal request ids to avoid collisions, so the worker
+        buffers are keyed by an internal id such as ``{external_id}-{8hex}``.
+        The driver should ensure ``request_id`` is unique within the session;
+        we resolve it to the internal id using a strict regex and fail-fast if
+        the mapping is ambiguous.
+        """
+        producer = getattr(self, "_dvi_stage2_producer", None)
+        if producer is None:
+            return
+        session_key = producer.session_key
+        expected_len = len(session_key) + 1
+        exact_key = session_key + (request_id,)
+
+        # Exact match: either randomization is disabled or the caller supplied
+        # the internal id directly.
+        if exact_key in producer._buffers:
+            matched = [request_id]
+        else:
+            pattern = re.compile(
+                rf"^{re.escape(request_id)}-[0-9a-f]{{8}}$"
+            )
+            matched = [
+                buf_key[-1]
+                for buf_key in producer._buffers.keys()
+                if len(buf_key) == expected_len
+                and buf_key[: len(session_key)] == session_key
+                and pattern.match(buf_key[-1])
+            ]
+            if len(matched) > 1:
+                self._dvi_finalize_ambiguous_count += 1
+                raise RuntimeError(
+                    f"Ambiguous request id mapping for {request_id!r}: "
+                    f"multiple internal ids matched {matched}"
+                )
+
+        if not matched:
+            # No records captured for this request; nothing to finalize.
+            self._dvi_finalize_no_match_count += 1
+            return
+
+        producer.finalize_request(
+            session_key,
+            matched[0],
+            prompt_token_ids,
+            response_token_ids,
+        )
+
+    def close_dvi_session(self) -> dict[str, Any]:
+        """Close the active DVI session(s) and return writer metrics.
+
+        Raises any writer error so the RPC caller knows the spool may not be
+        finalized. Hooks are removed before handoffs drain and writers close.
+
+        Returns:
+            A dict containing ``owner`` plus writer metrics and finalize
+            counters. Non-owner workers return ``{"owner": False}``.
+        """
+        model_runner = getattr(self, "model_runner", None)
+
+        # stage_0 hidden side (independent owner on the first PP rank).
+        stage0_writer = getattr(self, "_dvi_stage0_writer", None)
+        stage0_producer = getattr(self, "_dvi_stage0_producer", None)
+        stage0_metrics: dict[str, Any] = {}
+        if stage0_writer is not None:
+            if model_runner is not None and hasattr(
+                model_runner, "set_dvi_stage0_probe"
+            ):
+                model_runner.set_dvi_stage0_probe(None)
+            try:
+                try:
+                    if stage0_producer is not None:
+                        stage0_producer.close()
+                finally:
+                    stage0_metrics = stage0_writer.close()
+            finally:
+                self._dvi_stage0_writer = None
+                self._dvi_stage0_producer = None
+                self._dvi_stage0_probe = None
+
+        writer = getattr(self, "_dvi_writer", None)
+        if writer is None:
+            if stage0_writer is not None:
+                return {
+                    "owner": False,
+                    "stage0_owner": True,
+                    "stage0_metrics": stage0_metrics,
+                }
+            return {"owner": False}
+
+        metrics: dict[str, Any] = {}
+        producer = getattr(self, "_dvi_stage2_producer", None)
+        if model_runner is not None and hasattr(
+            model_runner, "set_dvi_telemetry_hook"
+        ):
+            model_runner.set_dvi_telemetry_hook(None)
+        try:
+            try:
+                if producer is not None:
+                    producer.close()
+            finally:
+                metrics = writer.close()
+        finally:
+            self._dvi_writer = None
+            self._dvi_stage2_producer = None
+            self._dvi_hook = None
+
+        return {
+            "owner": True,
+            **metrics,
+            "stage0_owner": stage0_writer is not None,
+            "stage0_metrics": stage0_metrics or None,
+            "finalize_no_match_count": getattr(
+                self, "_dvi_finalize_no_match_count", 0
+            ),
+            "finalize_ambiguous_count": getattr(
+                self, "_dvi_finalize_ambiguous_count", 0
+            ),
+        }
 
 
 class vLLMOmniColocateWorkerExtension(_OmniWorkerBase):

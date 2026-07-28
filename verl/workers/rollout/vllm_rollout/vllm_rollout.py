@@ -195,6 +195,32 @@ class ServerAdapter(BaseRollout):
         """Return the Ray actor name prefix matching the rollout type (e.g. 'vllm_' or 'vllm_omni_')."""
         return f"{self.config.get('name', 'vllm')}_"
 
+    def _get_server_handle(self) -> ray.actor.ActorHandle:
+        """Return the Ray actor handle for the vLLM HTTP server."""
+        if self.server_handle is None:
+            prefix = self._get_server_name_prefix()
+            self.server_handle = ray.get_actor(f"{prefix}server_{self.replica_rank}_{self.node_rank}")
+        return self.server_handle
+
+    async def start_dvi_session(
+        self,
+        spool_dir: str,
+        spool_metadata: dict[str, Any],
+        sampling_config: dict[str, Any],
+    ) -> None:
+        """Start a stage-2 DVI telemetry session on the rollout server."""
+        if self.rollout_rank != 0:
+            return
+        await self._get_server_handle().start_dvi_session.remote(
+            spool_dir, spool_metadata, sampling_config
+        )
+
+    async def close_dvi_session(self) -> dict[str, Any]:
+        """Close the stage-2 DVI telemetry session and return writer metrics."""
+        if self.rollout_rank != 0 or self.server_handle is None:
+            return {}
+        return await self.server_handle.close_dvi_session.remote()
+
     def generate_sequences(self, prompts: DataProto) -> DataProto:
         """Batch generate sequences in sync mode.
 

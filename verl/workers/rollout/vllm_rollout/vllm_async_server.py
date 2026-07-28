@@ -153,6 +153,12 @@ class vLLMHttpServer:
         self._server_address = ray.util.get_node_ip_address().strip("[]")
         self._server_port = None
 
+        # AsyncLLM engine client; set in run_server().
+        self.engine = None
+
+        # Stage-2 DVI telemetry session-level error counter.
+        self._dvi_finalize_error_count = 0
+
         # used for controlling vllm server profiler
         profiler_config = self.config.profiler
         tool_config = None
@@ -584,6 +590,17 @@ class vLLMHttpServer:
         else:
             stop_reason = finish_reason  # for more stop reason in the future
 
+        # Finalize DVI stage-2 telemetry for this request.
+        try:
+            await self.finalize_dvi_request(
+                request_id=request_id,
+                prompt_token_ids=prompt_ids,
+                response_token_ids=token_ids,
+            )
+        except Exception:
+            self._dvi_finalize_error_count += 1
+            logger.exception("Failed to finalize DVI request %s", request_id)
+
         num_preempted = None
 
         if hasattr(final_res.outputs[0], "num_preempted"):
@@ -769,6 +786,124 @@ class vLLMHttpServer:
         if self.node_rank != 0:
             return set()
         return await self.engine.list_loras()
+
+    # ------------------------------------------------------------------
+    # DVI L0 telemetry lifecycle RPCs
+    # ------------------------------------------------------------------
+    async def start_dvi_session(
+        self,
+        spool_dir: str,
+        spool_metadata: dict[str, Any],
+        sampling_config: dict[str, Any],
+    ) -> None:
+        """Start a dual-sided DVI telemetry session on all vLLM workers.
+
+        Exactly one stage_0 and one stage_2 worker per server must own their
+        respective spool. Any partial start is rolled back before the error is
+        returned to the driver.
+        """
+        if self.node_rank != 0:
+            return
+        if self.engine is None:
+            raise RuntimeError("vLLM engine is not initialized")
+
+        self._dvi_finalize_error_count = 0
+        try:
+            results = await self.engine.collective_rpc(
+                "start_dvi_session",
+                args=(spool_dir, spool_metadata, sampling_config),
+            )
+        except Exception:
+            try:
+                await self.engine.collective_rpc("close_dvi_session")
+            except Exception:
+                logger.exception(
+                    "Failed to roll back partially started DVI session"
+                )
+            raise
+
+        owners = [r for r in results if isinstance(r, dict) and r.get("owner")]
+        stage0_owners = [
+            r
+            for r in results
+            if isinstance(r, dict) and r.get("stage0_owner")
+        ]
+        if len(owners) != 1 or len(stage0_owners) != 1:
+            logger.error(
+                "Expected one DVI owner per side, got stage_2=%d stage_0=%d "
+                "(results=%s)",
+                len(owners),
+                len(stage0_owners),
+                results,
+            )
+            try:
+                await self.engine.collective_rpc("close_dvi_session")
+            except Exception:
+                logger.exception("Failed to roll back DVI session after owner mismatch")
+            raise RuntimeError(
+                "DVI session must have exactly one owner per side, got "
+                f"stage_2={len(owners)}, stage_0={len(stage0_owners)}"
+            )
+
+    async def finalize_dvi_request(
+        self,
+        request_id: str,
+        prompt_token_ids: list[int],
+        response_token_ids: list[int],
+    ) -> None:
+        """Finalize a request in the active stage-2 DVI session."""
+        if self.node_rank != 0:
+            return
+        if self.engine is None:
+            return
+        await self.engine.collective_rpc(
+            "finalize_dvi_request",
+            args=(request_id, prompt_token_ids, response_token_ids),
+        )
+
+    async def close_dvi_session(self) -> dict[str, Any]:
+        """Close the active dual-sided DVI telemetry session on all workers.
+
+        Returns the stage-2 owner worker's metrics plus a top-level ``ok``
+        flag. Both stage owners are identified from per-worker results, so
+        aggregation remains correct regardless of PP/TP layout.
+        """
+        if self.node_rank != 0 or self.engine is None:
+            return {"ok": True}
+        results = await self.engine.collective_rpc("close_dvi_session")
+        owners = [r for r in results if isinstance(r, dict) and r.get("owner")]
+        stage0_owners = [
+            r
+            for r in results
+            if isinstance(r, dict) and r.get("stage0_owner")
+        ]
+        owner_metrics = owners[0] if len(owners) == 1 else {}
+
+        merged: dict[str, Any] = {
+            "worker_metrics": results,
+            **owner_metrics,
+        }
+        merged["finalize_error_count"] = getattr(
+            self, "_dvi_finalize_error_count", 0
+        )
+        merged["ok"] = (
+            len(owners) == 1
+            and len(stage0_owners) == 1
+            and "error" not in owner_metrics
+            and merged["finalize_error_count"] == 0
+        )
+        return merged
+
+    async def close(self) -> None:
+        """Gracefully shut down the vLLM server, ensuring DVI spools are closed."""
+        if self.node_rank != 0:
+            return
+        try:
+            await self.close_dvi_session()
+        except Exception:
+            logger.exception("Failed to close DVI session during server shutdown")
+        if self.engine is not None:
+            await self.engine.shutdown()
 
     async def sleep(self):
         if self.node_rank != 0 or not self.config.free_cache_engine:
@@ -1332,6 +1467,80 @@ class vLLMReplica(RolloutReplica):
                 return r
 
         return {"aborted": False, "request_id": request_id, "error": "Request not found on any server"}
+
+    # ------------------------------------------------------------------
+    # DVI L0 telemetry lifecycle passthrough
+    # ------------------------------------------------------------------
+    async def start_dvi_session(
+        self,
+        spool_dir: str,
+        spool_metadata: dict[str, Any],
+        sampling_config: dict[str, Any],
+    ) -> None:
+        """Start a stage-2 DVI telemetry session on every server.
+
+        Each server writes into its own ``{spool_dir}/server_{idx}``
+        subdirectory so multiple servers never contend on the same spool.
+
+        If any server fails to start, already-started servers are closed so the
+        session remains transactionally clean.
+        """
+        if not self.servers:
+            return
+        from pathlib import Path
+
+        base = Path(spool_dir)
+        started: list[tuple[int, Any]] = []
+        try:
+            for idx, server in enumerate(self.servers):
+                await server.start_dvi_session.remote(
+                    str(base / f"server_{idx}"),
+                    spool_metadata,
+                    sampling_config,
+                )
+                started.append((idx, server))
+        except Exception:
+            logger.exception(
+                "Failed to start DVI session on server %d; rolling back %d "
+                "already-started server(s)",
+                idx,
+                len(started),
+            )
+            await asyncio.gather(*[
+                server.close_dvi_session.remote()
+                for _, server in started
+            ], return_exceptions=True)
+            raise
+
+    async def close_dvi_session(self) -> dict[str, Any]:
+        """Close the dual-sided DVI telemetry session on every server.
+
+        Returns a dict mapping ``server_{idx}`` to the per-server merged
+        metrics, plus a top-level ``ok`` flag that is ``False`` if any server
+        reports ``ok=False`` or raises. Errors from individual servers are
+        logged but not raised so that a failing spool on one server does not
+        prevent others from finalizing; the caller must check ``ok`` before
+        treating the session as valid.
+        """
+        if not self.servers:
+            return {"ok": True}
+
+        async def _close_one(idx: int, server):
+            try:
+                return await server.close_dvi_session.remote()
+            except Exception as e:
+                logger.exception("Failed to close DVI session on server %d", idx)
+                return {"error": str(e)}
+
+        results = await asyncio.gather(*[
+            _close_one(idx, server) for idx, server in enumerate(self.servers)
+        ])
+        merged = {f"server_{idx}": result for idx, result in enumerate(results)}
+        merged["ok"] = all(
+            isinstance(r, dict) and r.get("ok") is True and "error" not in r
+            for r in results
+        )
+        return merged
 
     # -----------------------------------------------------------------------
     # Hook methods for subclass overrides
