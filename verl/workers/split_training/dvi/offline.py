@@ -1,4 +1,4 @@
-"""CPU-only training and reporting for the DVI L0 offline phase."""
+"""Device-selectable training and reporting for the DVI L0 offline phase."""
 
 from __future__ import annotations
 
@@ -160,6 +160,11 @@ class DVITrainConfig:
     embed_base_projection: bool = True
     seed: int = 42
     validation_fraction: float = 0.0
+    device: str = "cpu"
+    max_steps: int | None = None
+    kl_direction: str = "forward"
+    entropy_coefficient: float = 0.0
+    overlap_coefficient: float = 0.0
 
     def validate(self) -> None:
         if self.rank <= 0:
@@ -176,6 +181,17 @@ class DVITrainConfig:
             raise ValueError("batch_size must be positive")
         if not 0.0 <= self.validation_fraction < 1.0:
             raise ValueError("validation_fraction must be in [0, 1)")
+        device = torch.device(self.device)
+        if device.type not in {"cpu", "cuda"}:
+            raise ValueError("device must select cpu or cuda")
+        if self.max_steps is not None and self.max_steps <= 0:
+            raise ValueError("max_steps must be positive when provided")
+        if self.kl_direction not in {"forward", "reverse"}:
+            raise ValueError("kl_direction must be forward or reverse")
+        if not math.isfinite(self.entropy_coefficient) or self.entropy_coefficient < 0:
+            raise ValueError("entropy_coefficient must be non-negative and finite")
+        if not math.isfinite(self.overlap_coefficient) or self.overlap_coefficient < 0:
+            raise ValueError("overlap_coefficient must be non-negative and finite")
 
 
 @dataclass
@@ -213,13 +229,20 @@ class DVITrainResult:
     final_train_kl: float | None = None
     draft_metadata_sha256: str = ""
     base_projection_embedded: bool = True
+    training_device: str = "cpu"
+    max_steps: int | None = None
+    optimizer_steps: int = 0
 
     # KL / teacher semantics metadata. Must match the source artifact manifest
     # so downstream reports do not mix forward/reverse/CE/PG objectives.
     kl_direction: str = "forward"
+    entropy_coefficient: float = 0.0
+    overlap_coefficient: float = 0.0
     teacher_distribution_kind: str = "processed_topk_residual"
     teacher_temperature: float | None = None
     topk_mass_coverage: float | None = None
+    draft_logit_semantics: str = "raw_target_logits"
+    calibration_temperature: float | None = None
 
     def validate(self) -> None:
         if self.schema_version != TRAIN_RESULT_SCHEMA_VERSION:
@@ -264,6 +287,36 @@ class DVITrainResult:
             raise ValueError("validation_fraction must be in [0, 1)")
         if self.terminal_records_excluded < 0:
             raise ValueError("terminal_records_excluded must be non-negative")
+        if self.max_steps is not None and self.max_steps <= 0:
+            raise ValueError("max_steps must be positive when present")
+        if self.optimizer_steps < 0:
+            raise ValueError("optimizer_steps must be non-negative")
+        if self.max_steps is not None and self.optimizer_steps != self.max_steps:
+            raise ValueError("optimizer_steps must equal max_steps")
+        if self.kl_direction not in {"forward", "reverse"}:
+            raise ValueError("kl_direction must be forward or reverse")
+        if not math.isfinite(self.entropy_coefficient) or self.entropy_coefficient < 0:
+            raise ValueError("entropy_coefficient must be non-negative and finite")
+        if not math.isfinite(self.overlap_coefficient) or self.overlap_coefficient < 0:
+            raise ValueError("overlap_coefficient must be non-negative and finite")
+        if self.draft_logit_semantics not in {
+            "raw_target_logits",
+            "processed_at_temperature",
+        }:
+            raise ValueError(
+                f"Unsupported draft logit semantics "
+                f"{self.draft_logit_semantics!r}"
+            )
+        if self.draft_logit_semantics == "processed_at_temperature":
+            if (
+                self.calibration_temperature is None
+                or not math.isfinite(self.calibration_temperature)
+                or self.calibration_temperature <= 0
+            ):
+                raise ValueError(
+                    "processed_at_temperature results require a positive "
+                    "finite calibration_temperature"
+                )
         if not self.base_projection_sha256 or not self.draft_checkpoint_sha256:
             raise ValueError("checkpoint hashes must be non-empty")
 
@@ -279,7 +332,7 @@ def _iter_batches(
         request = reader.request_index[record.request_id]
         if request_ids is not None and record.request_id not in request_ids:
             continue
-        if record.position == len(request.response_token_ids):
+        if record.position >= len(request.response_token_ids):
             # Retained in the artifact for diagnostics, but rollout never
             # drafts after a request has already emitted its terminal token.
             continue
@@ -294,28 +347,134 @@ def _iter_batches(
 def _lumped_kl(
     logits: torch.Tensor,
     records: list[DVICaptureRecord],
+    direction: str = "forward",
 ) -> torch.Tensor:
+    if direction not in {"forward", "reverse"}:
+        raise ValueError("direction must be forward or reverse")
     log_q = torch.log_softmax(logits.float(), dim=-1)
-    losses: list[torch.Tensor] = []
+    topk_lengths = [len(record.verifier_topk_ids) for record in records]
+    max_topk = max(topk_lengths)
+    ids = torch.zeros(
+        (len(records), max_topk),
+        dtype=torch.long,
+        device=logits.device,
+    )
+    teacher_logp = torch.zeros(
+        (len(records), max_topk),
+        dtype=torch.float32,
+        device=logits.device,
+    )
+    mask = torch.zeros(
+        (len(records), max_topk),
+        dtype=torch.bool,
+        device=logits.device,
+    )
     for row, record in enumerate(records):
-        ids = torch.tensor(record.verifier_topk_ids, dtype=torch.long)
-        teacher_logp = torch.tensor(
+        length = topk_lengths[row]
+        ids[row, :length] = torch.as_tensor(
+            record.verifier_topk_ids,
+            dtype=torch.long,
+            device=logits.device,
+        )
+        teacher_logp[row, :length] = torch.as_tensor(
             record.verifier_topk_logprobs,
             dtype=torch.float32,
+            device=logits.device,
         )
-        teacher_prob = teacher_logp.exp()
-        draft_logp = log_q[row, ids]
-        loss = torch.sum(teacher_prob * (teacher_logp - draft_logp))
+        mask[row, :length] = True
 
-        teacher_other = float(record.verifier_residual_mass)
-        if teacher_other > 0:
-            draft_topk_mass = draft_logp.exp().sum()
-            draft_other = (1.0 - draft_topk_mass).clamp_min(1e-12)
-            loss = loss + teacher_other * (
-                math.log(teacher_other) - torch.log(draft_other)
-            )
-        losses.append(loss)
-    return torch.stack(losses).mean()
+    draft_logp = log_q.gather(1, ids)
+    draft_prob = draft_logp.exp() * mask
+    teacher_prob = teacher_logp.exp() * mask
+    teacher_other = torch.as_tensor([record.verifier_residual_mass for record in records], dtype=torch.float32, device=logits.device)
+    draft_other = (1.0 - draft_prob.sum(dim=1)).clamp_min(1e-12)
+    if direction == "forward":
+        losses = (teacher_prob * (teacher_logp - draft_logp) * mask).sum(dim=1)
+        has_other = teacher_other > 0
+        residual_loss = teacher_other * (teacher_other.clamp_min(1e-12).log() - draft_other.log())
+        losses = losses + torch.where(has_other, residual_loss, torch.zeros_like(residual_loss))
+    else:
+        topk_loss = draft_prob * (draft_logp - teacher_logp.clamp_min(math.log(1e-12))) * mask
+        losses = topk_loss.sum(dim=1) + draft_other * (draft_other.log() - teacher_other.clamp_min(1e-12).log())
+    return losses.mean()
+
+
+def _lumped_overlap(
+    logits: torch.Tensor,
+    records: list[DVICaptureRecord],
+) -> torch.Tensor:
+    """Mean acceptance overlap Σ_x min(P(x), Q(x)) over the teacher top-k
+    support plus the residual lump.
+
+    This is the differentiable surrogate for the rejection-sampling expected
+    acceptance. ``min`` propagates the gradient through whichever branch is
+    smaller, which is the desired subgradient for maximizing the overlap.
+    """
+    log_q = torch.log_softmax(logits.float(), dim=-1)
+    topk_lengths = [len(record.verifier_topk_ids) for record in records]
+    max_topk = max(topk_lengths)
+    ids = torch.zeros(
+        (len(records), max_topk),
+        dtype=torch.long,
+        device=logits.device,
+    )
+    teacher_logp = torch.zeros(
+        (len(records), max_topk),
+        dtype=torch.float32,
+        device=logits.device,
+    )
+    mask = torch.zeros(
+        (len(records), max_topk),
+        dtype=torch.bool,
+        device=logits.device,
+    )
+    for row, record in enumerate(records):
+        length = topk_lengths[row]
+        ids[row, :length] = torch.as_tensor(
+            record.verifier_topk_ids,
+            dtype=torch.long,
+            device=logits.device,
+        )
+        teacher_logp[row, :length] = torch.as_tensor(
+            record.verifier_topk_logprobs,
+            dtype=torch.float32,
+            device=logits.device,
+        )
+        mask[row, :length] = True
+
+    draft_prob = log_q.gather(1, ids).exp() * mask
+    teacher_prob = teacher_logp.exp() * mask
+    teacher_other = torch.as_tensor(
+        [record.verifier_residual_mass for record in records],
+        dtype=torch.float32,
+        device=logits.device,
+    )
+    draft_other = (1.0 - draft_prob.sum(dim=1)).clamp_min(0.0)
+    overlap = torch.minimum(teacher_prob, draft_prob).sum(dim=1)
+    overlap = overlap + torch.minimum(teacher_other, draft_other)
+    return overlap.mean()
+
+
+def _training_objective(
+    logits,
+    records,
+    *,
+    kl_direction,
+    entropy_coefficient,
+    overlap_coefficient=0.0,
+):
+    loss = _lumped_kl(logits, records, direction=kl_direction)
+    if entropy_coefficient != 0.0:
+        log_q = torch.log_softmax(logits.float(), dim=-1)
+        entropy = -(log_q.exp() * log_q).sum(dim=-1).mean()
+        loss = loss - entropy_coefficient * entropy
+    if overlap_coefficient != 0.0:
+        loss = loss - overlap_coefficient * _lumped_overlap(logits, records)
+    return loss
+
+
+def _model_device(model: SplitDVIDraftHead) -> torch.device:
+    return model.lora_a.device
 
 
 def _evaluate(
@@ -323,19 +482,21 @@ def _evaluate(
     reader: DVIArtifactReader,
     batch_size: int,
     request_ids: frozenset[str] | None = None,
+    kl_direction: str = "forward",
 ) -> tuple[float, float, float, int]:
     total_loss = 0.0
     total_correct = 0
     total_mass = 0.0
     total_records = 0
     model.eval()
+    device = _model_device(model)
     with torch.no_grad():
         for records in _iter_batches(reader, batch_size, request_ids):
             hidden = torch.stack(
                 [record.stage_0_hidden.float() for record in records]
-            )
+            ).to(device)
             logits = model(hidden)
-            loss = _lumped_kl(logits, records)
+            loss = _lumped_kl(logits, records, direction=kl_direction)
             total_loss += float(loss) * len(records)
             predictions = logits.argmax(dim=-1).tolist()
             total_correct += sum(
@@ -389,6 +550,9 @@ def train_offline_draft_head(
 ) -> DVITrainResult:
     """Train the synthetic/offline draft head and publish a result directory."""
     config.validate()
+    device = torch.device(config.device)
+    if device.type == "cuda" and not torch.cuda.is_available():
+        raise RuntimeError("CUDA training requested but CUDA is unavailable")
     torch.manual_seed(config.seed)
     reader = DVIArtifactReader(artifact_dir)
     base_projection = _resolve_base_projection(reader, config, base_projection)
@@ -398,12 +562,12 @@ def train_offline_draft_head(
         alpha=config.alpha,
         norm=config.norm,
         seed=config.seed,
-    )
+    ).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=config.learning_rate)
 
     terminal_records_excluded = sum(
         record.position
-        == len(reader.request_index[record.request_id].response_token_ids)
+        >= len(reader.request_index[record.request_id].response_token_ids)
         for record in reader.iter_capture_records()
     )
 
@@ -413,11 +577,11 @@ def train_offline_draft_head(
         config.seed,
     )
     initial_train_kl, train_initial_accuracy, train_topk_mass, num_train = (
-        _evaluate(model, reader, config.batch_size, train_ids)
+        _evaluate(model, reader, config.batch_size, train_ids, kl_direction=config.kl_direction)
     )
     if validation_ids:
         initial_kl, initial_accuracy, topk_mass, num_validation = _evaluate(
-            model, reader, config.batch_size, validation_ids
+            model, reader, config.batch_size, validation_ids, kl_direction=config.kl_direction
         )
         evaluation_split = "validation"
     else:
@@ -428,28 +592,39 @@ def train_offline_draft_head(
         evaluation_split = "train"
     num_records = num_train + num_validation
     epoch_kl: list[float] = []
+    optimizer_steps = 0
     model.train()
-    for _ in range(config.epochs):
+    epoch = 0
+    while config.max_steps is not None or epoch < config.epochs:
+        if config.max_steps is not None and optimizer_steps >= config.max_steps:
+            break
         epoch_loss = 0.0
         epoch_records = 0
         for records in _iter_batches(reader, config.batch_size, train_ids):
+            if (
+                config.max_steps is not None
+                and optimizer_steps >= config.max_steps
+            ):
+                break
             hidden = torch.stack(
                 [record.stage_0_hidden.float() for record in records]
-            )
+            ).to(device)
             optimizer.zero_grad(set_to_none=True)
-            loss = _lumped_kl(model(hidden), records)
+            loss = _training_objective(model(hidden), records, kl_direction=config.kl_direction, entropy_coefficient=config.entropy_coefficient, overlap_coefficient=config.overlap_coefficient)
             loss.backward()
             optimizer.step()
+            optimizer_steps += 1
             epoch_loss += float(loss.detach()) * len(records)
             epoch_records += len(records)
         epoch_kl.append(epoch_loss / epoch_records)
+        epoch += 1
 
     final_train_kl, train_final_accuracy, _, _ = _evaluate(
-        model, reader, config.batch_size, train_ids
+        model, reader, config.batch_size, train_ids, kl_direction=config.kl_direction
     )
     if validation_ids:
         final_kl, final_accuracy, _, _ = _evaluate(
-            model, reader, config.batch_size, validation_ids
+            model, reader, config.batch_size, validation_ids, kl_direction=config.kl_direction
         )
     else:
         final_kl = final_train_kl
@@ -485,7 +660,26 @@ def train_offline_draft_head(
             "alpha": config.alpha,
             "vocab_size": reader.manifest.vocab_size,
             "hidden_size": reader.manifest.hidden_size,
+            "kl_direction": config.kl_direction,
+            "entropy_coefficient": config.entropy_coefficient,
+            "overlap_coefficient": config.overlap_coefficient,
         }
+        if (
+            reader.manifest.teacher_distribution_kind
+            == "processed_topk_residual"
+            and reader.manifest.teacher_temperature is not None
+            and reader.manifest.teacher_temperature > 0
+        ):
+            metadata["draft_logit_semantics"] = "processed_at_temperature"
+            metadata["calibration_temperature"] = (
+                reader.manifest.teacher_temperature
+            )
+            draft_logit_semantics = "processed_at_temperature"
+            calibration_temperature = reader.manifest.teacher_temperature
+        else:
+            metadata["draft_logit_semantics"] = "raw_target_logits"
+            draft_logit_semantics = "raw_target_logits"
+            calibration_temperature = None
         if not config.embed_base_projection:
             metadata.update(
                 base_projection_source="target_model",
@@ -526,6 +720,9 @@ def train_offline_draft_head(
             draft_checkpoint_sha256=checkpoint_hash,
             draft_metadata_sha256=metadata_hash,
             base_projection_embedded=config.embed_base_projection,
+            training_device=str(device),
+            max_steps=config.max_steps,
+            optimizer_steps=optimizer_steps,
             epoch_kl=epoch_kl,
             num_train_records=num_train,
             num_validation_records=num_validation,
@@ -536,10 +733,14 @@ def train_offline_draft_head(
             request_split_sha256=split_hash,
             initial_train_kl=initial_train_kl,
             final_train_kl=final_train_kl,
-            kl_direction=reader.manifest.kl_direction,
+            kl_direction=config.kl_direction,
+            entropy_coefficient=config.entropy_coefficient,
+            overlap_coefficient=config.overlap_coefficient,
             teacher_distribution_kind=reader.manifest.teacher_distribution_kind,
             teacher_temperature=reader.manifest.teacher_temperature,
             topk_mass_coverage=reader.manifest.topk_mass_coverage,
+            draft_logit_semantics=draft_logit_semantics,
+            calibration_temperature=calibration_temperature,
         )
         result.validate()
         with open(temp_dir / "train_result.json", "w", encoding="utf-8") as file:
@@ -611,6 +812,115 @@ def load_train_result(result_dir: str | Path) -> DVITrainResult:
     return result
 
 
+def evaluate_offline_draft_head(
+    result_dir: str | Path,
+    artifact_dir: str | Path,
+    base_projection: torch.Tensor,
+    batch_size: int | None = None,
+    device: str = "cpu",
+) -> dict[str, object]:
+    """Evaluate a trained compact/embedded head on an independent artifact."""
+    result = load_train_result(result_dir)
+    reader = DVIArtifactReader(artifact_dir)
+    if reader.manifest.base_checkpoint_hash != result.source_base_checkpoint_hash:
+        raise ValueError(
+            "Evaluation artifact base checkpoint does not match training"
+        )
+    base_projection = base_projection.float().cpu().contiguous()
+    expected_shape = (reader.manifest.vocab_size, reader.manifest.hidden_size)
+    if tuple(base_projection.shape) != expected_shape:
+        raise ValueError(
+            f"base projection shape {tuple(base_projection.shape)} does not "
+            f"match evaluation artifact shape {expected_shape}"
+        )
+    if _sha256_tensor(base_projection) != result.base_projection_sha256:
+        raise ValueError("Evaluation base projection checksum mismatch")
+
+    target_device = torch.device(device)
+    if target_device.type == "cuda" and not torch.cuda.is_available():
+        raise RuntimeError("CUDA evaluation requested but CUDA is unavailable")
+    model = SplitDVIDraftHead(
+        base_projection,
+        rank=result.rank,
+        alpha=result.alpha,
+        norm=result.norm,
+        seed=result.seed,
+    ).to(target_device)
+    checkpoint = load_safetensors(
+        str(Path(result_dir) / "draft_head.safetensors")
+    )
+    with torch.no_grad():
+        model.lora_a.copy_(checkpoint["lora_A.weight"])
+        model.lora_b.copy_(checkpoint["lora_B.weight"])
+        if model.norm_weight is not None:
+            model.norm_weight.copy_(checkpoint["norm.weight"])
+
+    total_loss = 0.0
+    total_correct = 0
+    total_entropy = 0.0
+    total_top1_probability = 0.0
+    total_margin = 0.0
+    wrong_confidence = 0.0
+    wrong_count = 0
+    total_mass = 0.0
+    total_records = 0
+    model.eval()
+    with torch.no_grad():
+        for records in _iter_batches(
+            reader, batch_size or result.batch_size
+        ):
+            hidden = torch.stack(
+                [record.stage_0_hidden.float() for record in records]
+            ).to(target_device)
+            logits = model(hidden)
+            log_probs = torch.log_softmax(logits.float(), dim=-1)
+            probs = log_probs.exp()
+            top2 = torch.topk(probs, 2, dim=-1)
+            predictions = top2.indices[:, 0].tolist()
+            confidences = top2.values[:, 0]
+            margins = top2.values[:, 0] - top2.values[:, 1]
+            entropy = -(probs * log_probs).sum(dim=-1)
+            loss = _lumped_kl(logits, records, direction=result.kl_direction)
+            total_loss += float(loss) * len(records)
+            for index, (prediction, record) in enumerate(
+                zip(predictions, records)
+            ):
+                correct = prediction == record.verifier_top1_id
+                total_correct += int(correct)
+                if not correct:
+                    wrong_confidence += float(confidences[index])
+                    wrong_count += 1
+            total_entropy += float(entropy.sum())
+            total_top1_probability += float(confidences.sum())
+            total_margin += float(margins.sum())
+            total_mass += sum(
+                1.0 - record.verifier_residual_mass for record in records
+            )
+            total_records += len(records)
+    if total_records == 0:
+        raise ValueError("Evaluation artifact contains no training records")
+    return {
+        "schema_version": "dvi-offline-eval-v1",
+        "result_dir": str(Path(result_dir).resolve()),
+        "artifact_dir": str(Path(artifact_dir).resolve()),
+        "artifact_manifest_sha256": _sha256_file(
+            Path(artifact_dir) / "manifest.json"
+        ),
+        "num_records": total_records,
+        "kl": total_loss / total_records,
+        "top1_accuracy": total_correct / total_records,
+        "draft_entropy": total_entropy / total_records,
+        "draft_top1_probability": total_top1_probability / total_records,
+        "draft_top1_margin": total_margin / total_records,
+        "wrong_top1_confidence": (
+            wrong_confidence / wrong_count if wrong_count else None
+        ),
+        "wrong_top1_count": wrong_count,
+        "mean_topk_mass": total_mass / total_records,
+        "device": str(target_device),
+    }
+
+
 def build_offline_report(
     result_dir: str | Path,
     artifact_dir: str | Path | None = None,
@@ -649,10 +959,15 @@ def build_offline_report(
             "alpha": result.alpha,
             "norm": result.norm,
             "learning_rate": result.learning_rate,
-            "epochs": result.epochs,
+        "epochs": result.epochs,
+        "max_steps": result.max_steps,
+        "optimizer_steps": result.optimizer_steps,
             "batch_size": result.batch_size,
             "seed": result.seed,
             "validation_fraction": result.validation_fraction,
+            "kl_direction": result.kl_direction,
+            "entropy_coefficient": result.entropy_coefficient,
+            "overlap_coefficient": result.overlap_coefficient,
         },
         "go_no_go": "not_evaluated",
         "go_no_go_reason": (

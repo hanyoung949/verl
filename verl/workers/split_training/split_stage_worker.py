@@ -133,8 +133,13 @@ class SplitStageWorker(Worker):
         loss_agg_mode = data.get("loss_agg_mode", cfg.loss_agg_mode)
         loss_scale_factor = data.get("loss_scale_factor", cfg.loss_scale_factor)
 
-        # Per-token log prob of the observed token at each position.
-        new_log_probs = logprobs_from_logits_naive(logits, input_ids)
+        # Causal-LM logits at position t predict the token at position t + 1.
+        # Keep log-probabilities indexed by the observed token position so they
+        # align with rollout old_log_probs and response_mask.
+        shifted_log_probs = logprobs_from_logits_naive(
+            logits[..., :-1, :], input_ids[..., 1:]
+        )
+        new_log_probs = F.pad(shifted_log_probs, (1, 0), value=0.0)
 
         neg_kl = torch.clamp(new_log_probs - old_log_probs, min=-20.0, max=20.0)
         ratio = torch.exp(neg_kl)
@@ -220,6 +225,23 @@ class SplitStageWorker(Worker):
     def get_trainable_state_dict(self):
         """Return the trainable (LoRA) state dict for weight sync."""
         return self.engine.stage.get_trainable_state_dict()
+
+    def save_checkpoint(self, local_path: str, global_step: int) -> dict:
+        """Persist this stage's adapter and optimizer state."""
+        self.engine.save_checkpoint(
+            local_path=local_path, global_step=global_step
+        )
+        return {
+            "stage": "stage_0" if self.is_head else "stage_2",
+            "global_step": global_step,
+        }
+
+    def load_checkpoint(self, local_path: str) -> dict:
+        """Restore this stage's adapter and optimizer state."""
+        self.engine.load_checkpoint(
+            local_path=local_path, del_local_after_load=False
+        )
+        return {"stage": "stage_0" if self.is_head else "stage_2", "loaded": True}
 
     def shutdown(self):
         """Clean up the process group."""

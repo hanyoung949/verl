@@ -471,6 +471,7 @@ class vLLMColocateWorkerExtension:
             spool_dir=stage0_dir,
             spool_metadata=merged_metadata,
             quota_bytes=quota_bytes,
+            queue_maxsize=int(merged_metadata.get("queue_maxsize", 1024)),
         )
         try:
             cfg = DVISamplingConfig(
@@ -604,6 +605,7 @@ class vLLMColocateWorkerExtension:
             spool_dir=Path(spool_dir),
             spool_metadata=merged_metadata,
             quota_bytes=quota_bytes,
+            queue_maxsize=int(merged_metadata.get("queue_maxsize", 1024)),
         )
 
         try:
@@ -702,13 +704,17 @@ class vLLMColocateWorkerExtension:
             pattern = re.compile(
                 rf"^{re.escape(request_id)}-[0-9a-f]{{8}}$"
             )
-            matched = [
-                buf_key[-1]
-                for buf_key in producer._buffers.keys()
-                if len(buf_key) == expected_len
-                and buf_key[: len(session_key)] == session_key
-                and pattern.match(buf_key[-1])
-            ]
+            candidates = (
+                producer._evaluation_request_ids
+                if producer.evaluation_mode
+                else (
+                    buf_key[-1]
+                    for buf_key in producer._buffers.keys()
+                    if len(buf_key) == expected_len
+                    and buf_key[: len(session_key)] == session_key
+                )
+            )
+            matched = [candidate for candidate in candidates if pattern.match(candidate)]
             if len(matched) > 1:
                 self._dvi_finalize_ambiguous_count += 1
                 raise RuntimeError(

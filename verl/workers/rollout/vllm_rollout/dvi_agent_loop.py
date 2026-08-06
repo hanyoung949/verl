@@ -87,7 +87,10 @@ class DVIRolloutTelemetryConfig:
     sampling_config: dict[str, Any]
     initial_policy: dict[str, str] | None = None
     handoff_pool_size: int = 64
+    capture_mode: str = "train"
     capture_dtype: str | None = None
+    draft_length: int = 4
+    bonus_token: bool = False
 
     @classmethod
     def from_rollout_config(cls, rollout_config: Any) -> DVIRolloutTelemetryConfig:
@@ -122,6 +125,11 @@ class DVIRolloutTelemetryConfig:
         handoff_pool_size = int(raw.get("handoff_pool_size", 64))
         if quota_bytes <= 0 or handoff_pool_size <= 0:
             raise ValueError("DVI quota_bytes and handoff_pool_size must be positive")
+        capture_mode = str(raw.get("capture_mode", "train"))
+        if capture_mode not in {"train", "evaluation"}:
+            raise ValueError(
+                "DVI capture_mode must be 'train' or 'evaluation'"
+            )
         sampling = dict(raw.get("sampling_config") or {})
         sampling.setdefault("sample_rate", 0.05)
         sampling.setdefault("max_per_request", 16)
@@ -131,6 +139,14 @@ class DVIRolloutTelemetryConfig:
             raise ValueError("DVI sample_rate must be in (0, 1]")
         if int(sampling["max_per_request"]) <= 0 or int(sampling["top_k"]) <= 0:
             raise ValueError("DVI max_per_request and top_k must be positive")
+        draft_length = int(raw.get("draft_length", 4))
+        bonus_token = bool(raw.get("bonus_token", capture_mode == "evaluation"))
+        if draft_length < 2:
+            raise ValueError("DVI draft_length must be at least 2")
+        if capture_mode == "evaluation" and not bonus_token:
+            raise ValueError(
+                "evaluation capture requires bonus_token=True for stochastic DVI"
+            )
 
         initial_policy = raw.get("initial_policy")
         if initial_policy is not None:
@@ -151,7 +167,10 @@ class DVIRolloutTelemetryConfig:
             sampling_config=sampling,
             initial_policy=initial_policy,
             handoff_pool_size=handoff_pool_size,
+            capture_mode=capture_mode,
             capture_dtype=raw.get("capture_dtype"),
+            draft_length=draft_length,
+            bonus_token=bonus_token,
         )
 
 
@@ -221,6 +240,10 @@ class DVIRolloutTelemetryCoordinator:
                 "tokenizer_revision": self.config.tokenizer_revision,
                 "quota_bytes": self.config.quota_bytes,
                 "handoff_pool_size": self.config.handoff_pool_size,
+                "capture_mode": self.config.capture_mode,
+                "draft_length": self.config.draft_length,
+                "num_proposals": self.config.draft_length - 1,
+                "bonus_token": self.config.bonus_token,
                 **resolved_policy,
             }
             if self.config.capture_dtype is not None:
